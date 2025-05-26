@@ -1,7 +1,7 @@
 import { Coordinate } from 'ol/coordinate';
+import { AppEventProcessor } from '@/api/event-processors/event-processor-children/app-event-processor';
 import { FeatureInfoEventProcessor } from '@/api/event-processors/event-processor-children/feature-info-event-processor';
 import EventHelper, { EventDelegateBase } from '@/api/events/event-helper';
-import { logger } from '@/core/utils/logger';
 import { TypeFeatureInfoEntry, TypeFeatureInfoLayerConfig, TypeLayerEntryConfig, TypeResultSet } from '@/api/config/types/map-schema-types';
 import { AbstractGVLayer } from '@/geo/layer/gv-layers/abstract-gv-layer';
 import { AbstractBaseLayer } from '@/geo/layer/gv-layers/abstract-base-layer';
@@ -11,7 +11,8 @@ import {
   TypeFeatureInfoResultSet,
   TypeFeatureInfoResultSetEntry,
 } from '@/core/stores/store-interface-and-intial-values/feature-info-state';
-import { AbortError } from '@/core/exceptions/core-exceptions';
+import { RequestAbortedError } from '@/core/exceptions/core-exceptions';
+import { logger } from '@/core/utils/logger';
 
 /**
  * A Layer-set working with the LayerApi at handling a result set of registered layers and synchronizing
@@ -39,7 +40,7 @@ export class FeatureInfoLayerSet extends AbstractLayerSet {
     // Register a handler on the map click
     this.layerApi.mapViewer.onMapSingleClick((mapViewer, payload) => {
       // Query all layers which can be queried
-      this.queryLayers(payload.lnglat).catch((error) => {
+      this.queryLayers(payload.lnglat).catch((error: unknown) => {
         // Log
         logger.logPromiseFailed('queryLayers in onMapSingleClick in FeatureInfoLayerSet', error);
       });
@@ -87,7 +88,7 @@ export class FeatureInfoLayerSet extends AbstractLayerSet {
    */
   #propagateToStore(resultSetEntry: TypeFeatureInfoResultSetEntry, eventType: EventType = 'click'): void {
     // Propagate
-    FeatureInfoEventProcessor.propagateFeatureInfoToStore(this.getMapId(), eventType, resultSetEntry).catch((error) => {
+    FeatureInfoEventProcessor.propagateFeatureInfoToStore(this.getMapId(), eventType, resultSetEntry).catch((error: unknown) => {
       // Log
       logger.logPromiseFailed('FeatureInfoEventProcessor.propagateToStore in FeatureInfoLayerSet', error);
     });
@@ -131,7 +132,7 @@ export class FeatureInfoLayerSet extends AbstractLayerSet {
       // If layer was found
       if (layer && layer instanceof AbstractGVLayer) {
         // If state is not in visible range
-        if (!AbstractLayerSet.isInVisibleRange(layer)) return;
+        if (!AbstractLayerSet.isInVisibleRange(layer, this.layerApi.mapViewer.getView().getZoom())) return;
 
         // Flag processing
         this.resultSet[layerPath].features = undefined;
@@ -151,6 +152,7 @@ export class FeatureInfoLayerSet extends AbstractLayerSet {
 
         // Process query on results data
         const promiseResult = AbstractLayerSet.queryLayerFeatures(
+          this.layerApi.mapViewer.map,
           layer,
           queryType,
           longLatCoordinate,
@@ -175,15 +177,21 @@ export class FeatureInfoLayerSet extends AbstractLayerSet {
             // Use the response to possibly patch the layer config metadata
             if (arrayOfRecords.length) this.#patchMissingMetadataIfNecessary(layerPath, arrayOfRecords[0]);
 
+            // Filter out unsymbolized features if the showUnsymbolizedFeatures config is false
+            if (!AppEventProcessor.getShowUnsymbolizedFeatures(this.getMapId())) {
+              // eslint-disable-next-line no-param-reassign
+              arrayOfRecords = arrayOfRecords.filter((record) => record.featureIcon);
+            }
+
             // Keep the features retrieved
             this.resultSet[layerPath].features = arrayOfRecords;
 
             // Query was processed
             this.resultSet[layerPath].queryStatus = 'processed';
           })
-          .catch((error) => {
+          .catch((error: unknown) => {
             // If aborted
-            if (AbortError.isAbortError(error)) {
+            if (error instanceof RequestAbortedError) {
               // Log
               logger.logDebug('Query aborted and replaced by another one.. keep spinning..');
             } else {

@@ -69,6 +69,8 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
     refreshLayer,
     zoomToLayerExtent,
     getLayerBounds,
+    getLayerDefaultFilter,
+    getLayerServiceProjection,
     setLayerHoverable,
     setLayerQueryable,
   } = useLayerStoreActions();
@@ -78,6 +80,8 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
   const layersData = useDataTableAllFeaturesDataArray();
   const metadataUrl = useAppMetadataServiceURL();
   const selectedLayer = layersData.find((_layer) => _layer.layerPath === layerDetails?.layerPath);
+  const layerFilter = getLayerDefaultFilter(layerDetails.layerPath);
+  const layerNativeProjection = getLayerServiceProjection(layerDetails.layerPath);
 
   // Is highlight button disabled?
   const isLayerHighlightCapable = layerDetails.controls?.highlight;
@@ -110,8 +114,22 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
     };
   }, [layersData, layerDetails, selectedLayer]);
 
+  // GV Wrapped in useEffect since it was throwing a warning otherwise
+  useEffect(() => {
+    // Log
+    logger.logTraceUseEffect('LAYER DETAILS - Bounds', layerDetails);
+    if (layerDetails.bounds === undefined || layerDetails.bounds![0] === Infinity) {
+      const bounds = getLayerBounds(layerDetails.layerPath);
+      if (bounds) layerDetails.bounds = bounds;
+    }
+  }, [layerDetails, getLayerBounds]);
+
+  const handleRefreshLayer = (): void => {
+    refreshLayer(layerDetails.layerPath);
+  };
+
   const handleZoomTo = (): void => {
-    zoomToLayerExtent(layerDetails.layerPath).catch((error) => {
+    zoomToLayerExtent(layerDetails.layerPath).catch((error: unknown) => {
       // Log
       logger.logPromiseFailed('in zoomToLayerExtent in layer-details.handleZoomTo', error);
     });
@@ -123,21 +141,12 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
       !layersData.filter((layers) => layers.layerPath === layerDetails.layerPath && !!layers?.features?.length).length ||
       layerDetails.layerStatus === LAYER_STATUS.ERROR
     ) {
-      triggerGetAllFeatureInfo(layerDetails.layerPath).catch((error) => {
+      triggerGetAllFeatureInfo(layerDetails.layerPath).catch((error: unknown) => {
         // Log
         logger.logPromiseFailed('Failed to triggerGetAllFeatureInfo in single-layer.handleLayerClick', error);
       });
     }
     enableFocusTrap({ activeElementId: 'layerDataTable', callbackElementId: `table-details` });
-  };
-
-  if (layerDetails.bounds === undefined || layerDetails.bounds![0] === Infinity) {
-    const bounds = getLayerBounds(layerDetails.layerPath);
-    if (bounds) layerDetails.bounds = bounds;
-  }
-
-  const handleRefreshLayer = (): void => {
-    refreshLayer(layerDetails.layerPath);
   };
 
   const handleHighlightLayer = (): void => {
@@ -164,8 +173,7 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
     if (!layerDetails.canToggle) {
       return (
         <IconButton disabled tooltip={t('layers.visibilityIsAlways') as string}>
-          {' '}
-          <CheckBoxIcon color="disabled" />{' '}
+          <CheckBoxIcon color="disabled" />
         </IconButton>
       );
     }
@@ -181,8 +189,7 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
     if (!layerDetails.canToggle) {
       return (
         <IconButton disabled>
-          {' '}
-          <CheckBoxIcon color="disabled" />{' '}
+          <CheckBoxIcon color="disabled" />
         </IconButton>
       );
     }
@@ -379,16 +386,18 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
     return (
       <Box>
         <Button type="text" sx={{ fontSize: theme.palette.geoViewFontSize.sm }} onClick={() => setIsInfoCollapse(!isInfoCollapse)}>
-          {`${t('layers.moreInfo')!}`}
+          {`${t('layers.moreInfo')}`}
           <IconButton className="buttonOutline" edge="end" size="small" tooltip={t('layers.toggleCollapse')!}>
             {isInfoCollapse ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
           </IconButton>
         </Button>
         <Collapse in={isInfoCollapse} sx={sxClasses.layerInfo}>
-          <Box>{`${t('layers.layerType')!}${layerDetails.type}`}</Box>
+          <Box>{`${t('layers.layerType')}${layerDetails.type}`}</Box>
+          {layerNativeProjection && <Box>{`${t('layers.layerServiceProjection')}${layerNativeProjection}`}</Box>}
+          {layerFilter && <Box>{`${t('layers.layerDefaultFilter')}${layerFilter}`}</Box>}
           {resources !== '' && (
             <Box className="info-container">
-              {`${t('layers.layerResource')!}`}
+              {`${t('layers.layerResource')}`}
               <a href={resources} target="_blank" rel="noopener noreferrer">
                 {resources}
               </a>
@@ -396,7 +405,7 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
           )}
           {validId && (
             <Box className="info-container">
-              {`${t('layers.layerMetadata')!}`}
+              {`${t('layers.layerMetadata')}`}
               <a href={`${metadataUrl}${id}`} target="_blank" rel="noopener noreferrer">
                 {`${id}`}
               </a>
@@ -406,7 +415,7 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
             <Switch
               size="small"
               onChange={() => setLayerHoverable(layerDetails.layerPath, !layerDetails.hoverable!)}
-              title={t('layers.layerHoverable')!}
+              label={t('layers.layerHoverable')!}
               checked={layerDetails.hoverable}
             />
           )}
@@ -414,7 +423,7 @@ export function LayerDetails(props: LayerDetailsProps): JSX.Element {
             <Switch
               size="small"
               onChange={() => setLayerQueryable(layerDetails.layerPath, !layerDetails.queryable!)}
-              title={t('layers.layerQueryable')!}
+              label={t('layers.layerQueryable')!}
               checked={layerDetails.queryable}
             />
           )}

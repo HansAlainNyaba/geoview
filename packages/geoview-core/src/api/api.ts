@@ -13,6 +13,7 @@ import * as GeoUtilities from '@/geo/utils/utilities';
 
 import { initMapDivFromFunctionCall } from '@/app';
 import EventHelper, { EventDelegateBase } from '@/api/events/event-helper';
+import { InitDivNotExistError, MapViewerNotFoundError } from '@/core/exceptions/geoview-exceptions';
 
 /**
  * Class used to handle api calls (events, functions etc...)
@@ -59,7 +60,6 @@ export class API {
 
   /**
    * Gets the list of all map IDs currently in the collection.
-   *
    * @returns {string[]} Array of map IDs
    */
   getMapViewerIds(): string[] {
@@ -68,50 +68,62 @@ export class API {
 
   /**
    * Gets a map viewer instance by its ID.
-   *
    * @param {string} mapId - The unique identifier of the map to retrieve
    * @returns {MapViewer} The map viewer instance if found
-   * @throws {Error} If the map with the specified ID is not found
+   * @throws {MapViewerNotFoundError} If the map with the specified ID is not found
    */
   getMapViewer(mapId: string): MapViewer {
+    // Get the map instance
     const map = this.#maps[mapId];
-    // We use regular error because there is no valid mapId
-    if (!map) throw new Error(`Map with ID ${mapId} not found`);
 
+    // Validate the map viewer was found. If not throw MapViewerNotFoundError
+    if (!map) throw new MapViewerNotFoundError(mapId);
+
+    // Return it
     return map;
   }
 
   /**
-   * Delete a map viewer instance by its ID.
-   *
+   * Asynchronously gets a map viewer instance by its ID.
+   * @param {string} mapId - The unique identifier of the map to retrieve
+   * @returns {Promise<MapViewer>} The map viewer instance when/if found.
+   * @throws {Error} If the map with the specified ID is not found
+   */
+  async getMapViewerAsync(mapId: string): Promise<MapViewer> {
+    // Wait for the MapViewer to be available
+    await Utilities.whenThisThen(() => this.hasMapViewer(mapId));
+
+    // Return the now available MapViewer
+    return this.getMapViewer(mapId);
+  }
+
+  /**
+   * Deletes a map viewer instance by its ID.
    * @param {string} mapId - The unique identifier of the map to delete
    * @param {boolean} deleteContainer - True if we want to delete div from the page
    * @returns {Promise<HTMLElement>} The Promise containing the HTML element
    */
-  deleteMapViewer(mapId: string, deleteContainer: boolean): Promise<HTMLElement> {
+  async deleteMapViewer(mapId: string, deleteContainer: boolean): Promise<HTMLElement> {
     if (!this.hasMapViewer(mapId)) {
+      // TODO: Check - Should probably fail instead of returning an empty div? And catch the error higher?
+
       // We cannot throw an error because the mapdId may not exist and we do not want to crash the viewer.
       logger.logWarning(`Cannot delete map. Map with ID ${mapId} not found`);
 
       // Return an empty div
-      const div = document.createElement('div');
-      return Promise.resolve(div);
+      return document.createElement('div');
     }
 
     // Only delete from #maps after successful removal
-    return this.getMapViewer(mapId)
-      .remove(deleteContainer)
-      .then((element: HTMLElement) => {
-        // Delete the map instance from the maps array, will delete attached plugins
-        delete this.#maps[mapId];
+    const element = await this.getMapViewer(mapId).remove(deleteContainer);
 
-        return element;
-      });
+    // Delete the map instance from the maps array, will delete attached plugins
+    delete this.#maps[mapId];
+    return element;
   }
 
   /**
-   * Return true if a map id is already registered.
-   *
+   * Returns true if a map id is already registered.
    * @param {string} mapId - The unique identifier of the map to retrieve
    * @returns {boolean} True if map exist
    */
@@ -194,21 +206,17 @@ export class API {
    * @param {number} divHeight - height of the div to inject the map in (mandatory if the map reloads)
    */
   // This function is called by the template, and since the template use the instance of the object from cgpv.api, this function has to be on the instance, not static. Refactor this?
-  // eslint-disable-next-line @typescript-eslint/class-methods-use-this
-  async createMapFromConfig(divId: string, mapConfig: string, divHeight?: number): Promise<void> {
+  async createMapFromConfig(divId: string, mapConfig: string, divHeight?: number): Promise<MapViewer> {
     // Get the map div
     const mapDiv = document.getElementById(divId);
+    if (!mapDiv) throw new InitDivNotExistError(divId);
+
     if (divHeight) mapDiv!.style.height = `${divHeight}px`;
 
-    // If found the map div
-    if (mapDiv) {
-      // Init by function call
-      await initMapDivFromFunctionCall(mapDiv, mapConfig);
-      this.#emitMapAddedToDiv({ mapId: divId });
-      return Promise.resolve();
-    }
-
-    return Promise.reject(new Error(`Div with id ${divId} does not exist`));
+    // Init by function call
+    const mapViewer = await initMapDivFromFunctionCall(mapDiv, mapConfig);
+    this.#emitMapAddedToDiv({ mapId: divId });
+    return mapViewer;
   }
 
   /**
@@ -270,7 +278,7 @@ export class API {
 /**
  * Define a delegate for the event handler function signature
  */
-type MapViewerReadyDelegate = EventDelegateBase<API, MapViewerReadyEvent, void>;
+export type MapViewerReadyDelegate = EventDelegateBase<API, MapViewerReadyEvent, void>;
 
 /**
  * Define an event for the delegate
@@ -283,7 +291,7 @@ export type MapViewerReadyEvent = {
 /**
  * Define a delegate for the event handler function signature
  */
-type MapAddedToDivDelegate = EventDelegateBase<API, MapAddedToDivEvent, void>;
+export type MapAddedToDivDelegate = EventDelegateBase<API, MapAddedToDivEvent, void>;
 
 /**
  * Define an event for the delegate

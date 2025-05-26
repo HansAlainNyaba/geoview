@@ -5,7 +5,8 @@ import { Extent } from 'ol/extent';
 import Feature from 'ol/Feature';
 import { Layer } from 'ol/layer';
 import Source from 'ol/source/Source';
-import { shared as iconImageCache } from 'ol/style/IconImageCache';
+import { Projection as OLProjection } from 'ol/proj';
+import { Map as OLMap } from 'ol';
 
 import { Style } from 'ol/style';
 import cloneDeep from 'lodash/cloneDeep';
@@ -29,32 +30,39 @@ import {
 } from '@/api/config/types/map-schema-types';
 import { getLegendStyles, getFeatureImageSource, processStyle } from '@/geo/utils/renderer/geoview-renderer';
 import { TypeLegend } from '@/core/stores/store-interface-and-intial-values/layer-state';
-import { MapEventProcessor } from '@/api/event-processors/event-processor-children/map-event-processor';
-import { MapViewer } from '@/geo/map/map-viewer';
 import { AbstractBaseLayer } from '@/geo/layer/gv-layers/abstract-base-layer';
 import { SnackbarType } from '@/core/utils/notifications';
-import { NotImplementedError } from '@/core/exceptions/core-exceptions';
-import { GeoViewError } from '@/core/exceptions/geoview-exceptions';
+import { NotImplementedError, NotSupportedError } from '@/core/exceptions/core-exceptions';
+import { LayerNotQueryableError } from '@/core/exceptions/layer-exceptions';
 import { createAliasLookup } from '@/geo/layer/gv-layers/utils';
+import { doUntil } from '@/core/utils/utilities';
+import { TypeJsonArray } from '@/api/config/types/config-types';
 
 /**
  * Abstract Geoview Layer managing an OpenLayer layer.
  */
 export abstract class AbstractGVLayer extends AbstractBaseLayer {
-  // The default hit tolerance the query should be using
-  static DEFAULT_HIT_TOLERANCE: number = 4;
+  /** The default hit tolerance the query should be using */
+  static readonly DEFAULT_HIT_TOLERANCE: number = 4;
 
-  // The default hit tolerance
-  hitTolerance: number = AbstractGVLayer.DEFAULT_HIT_TOLERANCE;
+  /** The default loading period before we show a message to the user about a layer taking a long time to render on map */
+  static readonly DEFAULT_LOADING_PERIOD: number = 8 * 1000; // 8 seconds
+
+  /** Indicates if the layer has become in loaded status at least once already */
+  loadedOnce: boolean = false;
+
+  /** Counts the number of times the loading happened. */
+  loadingCounter: number = 0;
+
+  /** Marks the latest loading count for the layer.
+   * This useful to know when the put the layer loaded status back correctly with parallel processing happening */
+  loadingMarker: number = 0;
 
   // The OpenLayer source
   #olSource: Source;
 
   /** Style to apply to the vector layer. */
   #layerStyle?: TypeLayerStyleConfig;
-
-  /** Layer temporal dimension */
-  #layerTemporalDimension?: TimeDimension;
 
   /** Date format object used to translate server to ISO format and ISO to server format */
   #serverDateFragmentsOrder?: TypeDateFragments;
@@ -78,26 +86,31 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   #onLayerFilterAppliedHandlers: LayerFilterAppliedDelegate[] = [];
 
   // Keep all callback delegates references
-  #onIndividualLayerLoadedHandlers: IndividualLayerLoadedDelegate[] = [];
+  #onLayerFirstLoadedHandlers: LayerLoadDelegate[] = [];
+
+  // Keep all callback delegates references
+  #onLayerLoadingHandlers: LayerLoadDelegate[] = [];
+
+  // Keep all callback delegates references
+  #onLayerLoadedHandlers: LayerLoadDelegate[] = [];
 
   // Keep all callback delegates references
   #onLayerMessageHandlers: LayerMessageDelegate[] = [];
 
   /**
    * Constructs a GeoView layer to manage an OpenLayer layer.
-   * @param {string} mapId - The map id
-   * @param {BaseLayer} olLayer - The OpenLayer layer.
+   * @param {Source} olSource - The OpenLayer Source.
    * @param {AbstractBaseLayerEntryConfig} layerConfig - The layer configuration.
    */
-  protected constructor(mapId: string, olSource: Source, layerConfig: AbstractBaseLayerEntryConfig) {
-    super(mapId, layerConfig);
+  protected constructor(olSource: Source, layerConfig: AbstractBaseLayerEntryConfig) {
+    super(layerConfig);
     this.#olSource = olSource;
 
     // Keep the date formatting information
     this.#serverDateFragmentsOrder = layerConfig.geoviewLayerConfig.serviceDateFormat
       ? DateMgt.getDateFragmentsOrder(layerConfig.geoviewLayerConfig.serviceDateFormat)
       : undefined;
-    this.#externalFragmentsOrder = DateMgt.getDateFragmentsOrder(layerConfig.geoviewLayerConfig.externalDateFormat);
+    this.#externalFragmentsOrder = layerConfig.getExternalFragmentsOrder();
 
     // Boolean indicating if the layer should be included in time awareness functions such as the Time Slider. True by default.
     this.#isTimeAware = layerConfig.geoviewLayerConfig.isTimeAware === undefined ? true : layerConfig.geoviewLayerConfig.isTimeAware;
@@ -107,19 +120,12 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   }
 
   /**
-   * Gets the bounds for the layer.
-   * @returns {Extent | undefined} The layer bounding box.
-   */
-  getBounds(): Extent | undefined {
-    // Redirect to overridable method
-    return this.onGetBounds();
-  }
-
-  /**
-   * Must override method to return the bounds of a layer.
+   * Must override method to return the bounds of a layer in the given projection.
+   * @param {OLProjection} projection - The projection to get the bounds into.
+   * @param {number} stops - The number of stops to use to generate the extent.
    * @returns {Extent} The layer bounding box.
    */
-  abstract onGetBounds(): Extent | undefined;
+  abstract onGetBounds(projection: OLProjection, stops: number): Extent | undefined;
 
   /**
    * Initializes the GVLayer. This function checks if the source is ready and if so it calls onLoaded() to pursue initialization of the layer.
@@ -128,21 +134,140 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   init(): void {
     // Activation of the load end/error listeners
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (this.#olSource as any).once(['featuresloadend', 'imageloadend', 'tileloadend'], this.onLoaded.bind(this));
+    (this.#olSource as any).on(['featuresloadstart', 'imageloadstart', 'tileloadstart'], this.onLoading.bind(this));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (this.#olSource as any).once(['featuresloaderror', 'tileloaderror'], this.onError.bind(this));
+    (this.#olSource as any).on(['featuresloadend', 'imageloadend', 'tileloadend'], this.onLoaded.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.#olSource as any).on(['featuresloaderror', 'tileloaderror'], this.onError.bind(this));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (this.#olSource as any).on(['imageloaderror'], this.onImageLoadError.bind(this));
   }
 
   /**
-   * Gets the MapViewer where the layer resides
-   * @returns {MapViewer} The MapViewer
+   * Overridable method called when the layer has started to load itself on the map.
+   * @param {unknown} event - The event which is being triggered.
    */
-  getMapViewer(): MapViewer {
-    // GV The GVLayers need a reference to the MapViewer to be able to perform operations.
-    // GV This is a trick to obtain it. Otherwise, it'd need to be provided via constructor.
-    return MapEventProcessor.getMapViewer(this.getMapId());
+  protected onLoading(event: unknown): void {
+    // Increment the counter
+    this.loadingCounter++;
+
+    // Mark the current event with the loading counter, this is a trick using the wrapper to re-obtain it in the 'onLoaded' function below.
+    // eslint-disable-next-line no-underscore-dangle
+    this.#findWrapperBetweenEventHandlers(event)._loadingCounter = this.loadingCounter;
+
+    // Log it, leaving the logDebug for dev purposes
+    // eslint-disable-next-line no-underscore-dangle
+    // logger.logDebug('PRIOR', this.#findWrapperBetweenEventHandlers(event)._loadingCounter);
+
+    // Get the layer config
+    const layerConfig = this.getLayerConfig();
+
+    // Set the layer has loading
+    layerConfig.setLayerStatusLoading();
+
+    // Update the parent group if any
+    this.getLayerConfig().updateLayerStatusParent();
+
+    // Start a watcher and bind the loadingCounter with it
+    this.#startLoadingPeriodWatcher(this.loadingCounter);
+
+    // Emit event for all layer load events
+    this.#emitLayerLoading({ layerPath: this.getLayerPath() });
+  }
+
+  /**
+   * Overridable method called when the layer has been loaded correctly.
+   * @param {unknown} event - The event which is being triggered.
+   */
+  protected onLoaded(event: unknown): void {
+    // Log it, leaving the logDebug for dev purposes
+    // eslint-disable-next-line no-underscore-dangle
+    // logger.logDebug('AFTER', this.#findWrapperBetweenEventHandlers(event)._loadingCounter);
+
+    // If it's not the 'loaded' that correspond to the last 'loading' (asynchronicity thing)
+    // eslint-disable-next-line no-underscore-dangle
+    if (this.loadingCounter !== this.#findWrapperBetweenEventHandlers(event)._loadingCounter) return;
+
+    // Log it, leaving the logDebug for dev purposes
+    // eslint-disable-next-line no-underscore-dangle
+    // logger.logDebug('AFTER CHECKED', this.#findWrapperBetweenEventHandlers(event)._loadingCounter);
+
+    // Get the layer config
+    const layerConfig = this.getLayerConfig();
+
+    // Set the layer config status to loaded to keep mirroring the AbstractGeoViewLayer for now
+    layerConfig.setLayerStatusLoaded();
+
+    // Update the parent group if any
+    this.getLayerConfig().updateLayerStatusParent();
+
+    // If first time
+    if (!this.loadedOnce) {
+      // Now that the layer is loaded, set its visibility correctly (had to be done in the loaded event, not before, per prior note in pre-refactor)
+      this.setVisible(layerConfig.initialSettings?.states?.visible !== false);
+
+      // Emit event for the first time the layer got loaded
+      this.#emitLayerFirstLoaded({ layerPath: this.getLayerPath() });
+    }
+
+    // Flag
+    this.loadedOnce = true;
+
+    // Emit event for all layer load events
+    this.#emitLayerLoaded({ layerPath: this.getLayerPath() });
+  }
+
+  /**
+   * Overridable method called when the layer is in error and couldn't be loaded correctly.
+   * @param {unknown} event - The event which is being triggered.
+   */
+  protected onError(event: unknown): void {
+    // Log
+    logger.logError(`An error happened on the layer: ${this.getLayerPath()} after it was processed and added on the map.`, event);
+
+    // Check the layer status before
+    const layerStatusBefore = this.getLayerConfig().layerStatus;
+
+    // If we were not error before
+    if (layerStatusBefore !== 'error') {
+      // Set the layer config status to error to keep mirroring the AbstractGeoViewLayer for now
+      this.getLayerConfig().setLayerStatusError();
+
+      // Update the parent group if any
+      this.getLayerConfig().updateLayerStatusParent();
+
+      // Emit about the error
+      this.emitMessage('layers.errorNotLoaded', [this.getLayerName()], 'error', true);
+    } else {
+      // We've already emitted an erorr to the user about the layer being in error, skip
+    }
+  }
+
+  /**
+   * Overridable method called when the layer image is in error and couldn't be loaded correctly.
+   * We do not put the layer status as error, as this could be specific to a zoom level and the layer is otherwise fine.
+   * @param {unknown} event - The event which is being triggered.
+   */
+  protected onImageLoadError(event: unknown): void {
+    // Log
+    logger.logError(`Error loading source image for layer: ${this.getLayerPath()}.`, event);
+
+    // Check the layer status before
+    const layerStatusBefore = this.getLayerConfig().layerStatus;
+
+    // If we were not error before
+    if (layerStatusBefore !== 'error') {
+      // Set the layer config status to error to keep mirroring the AbstractGeoViewLayer for now
+      this.getLayerConfig().setLayerStatusError();
+
+      // Update the parent group if any
+      this.getLayerConfig().updateLayerStatusParent();
+
+      // Emit about the error
+      this.emitMessage('layers.errorImageLoad', [this.getLayerName()], 'error', true);
+    } else {
+      // We've already emitted an erorr to the user about the layer being in error, skip
+    }
   }
 
   /**
@@ -171,10 +296,18 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   }
 
   /**
+   * Gets the hit tolerance associated with the layer.
+   * @returns {number} The hit tolerance
+   */
+  // eslint-disable-next-line @typescript-eslint/class-methods-use-this
+  getHitTolerance(): number {
+    return AbstractGVLayer.DEFAULT_HIT_TOLERANCE;
+  }
+
+  /**
    * Gets the layer style
    * @returns The layer style
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   getStyle(): TypeLayerStyleConfig | undefined {
     return this.#layerStyle;
   }
@@ -186,6 +319,17 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   setStyle(style: TypeLayerStyleConfig): void {
     this.#layerStyle = style;
     this.#emitLayerStyleChanged({ style });
+  }
+
+  /**
+   * Gets the bounds for the layer in the given projection.
+   * @param {OLProjection} projection - The projection to get the bounds into.
+   * @param {number} stops - The number of stops to use to generate the extent.
+   * @returns {Extent | undefined} The layer bounding box.
+   */
+  getBounds(projection: OLProjection, stops: number): Extent | undefined {
+    // Redirect to overridable method
+    return this.onGetBounds(projection, stops);
   }
 
   /**
@@ -207,15 +351,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
    * @returns {TimeDimension | undefined} The temporal dimension associated to the layer or undefined.
    */
   getTemporalDimension(): TimeDimension | undefined {
-    return this.#layerTemporalDimension;
-  }
-
-  /**
-   * Sets the temporal dimension for the layer.
-   * @param {TimeDimension} temporalDimension - The value to assign to the layer temporal dimension property.
-   */
-  setTemporalDimension(temporalDimension: TimeDimension): void {
-    this.#layerTemporalDimension = temporalDimension;
+    return this.getLayerConfig().getTemporalDimension();
   }
 
   /**
@@ -236,28 +372,12 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
 
   /**
    * Gets the in visible range value
+   * @param {number | undefined} currentZoom - The map current zoom
    * @returns {boolean} true if the layer is in visible range
    */
-  getInVisibleRange(): boolean {
-    const mapZoom = this.getMapViewer().getView().getZoom();
-    return mapZoom! > this.getMinZoom() && mapZoom! <= this.getMaxZoom();
-  }
-
-  /**
-   * Overridable method called when the layer has been loaded correctly
-   */
-  protected onLoaded(): void {
-    // Get the layer config
-    const layerConfig = this.getLayerConfig();
-
-    // Set the layer config status to loaded to keep mirroring the AbstractGeoViewLayer for now
-    layerConfig.setLayerStatusLoaded();
-
-    // Now that the layer is loaded, set its visibility correctly (had to be done in the loaded event, not before, per prior note in pre-refactor)
-    this.setVisible(layerConfig.initialSettings?.states?.visible !== false);
-
-    // Emit event
-    this.#emitIndividualLayerLoaded({ layerPath: this.getLayerPath() });
+  getInVisibleRange(currentZoom: number | undefined): boolean {
+    if (!currentZoom) return false;
+    return currentZoom > this.getMinZoom() && currentZoom <= this.getMaxZoom();
   }
 
   /**
@@ -289,29 +409,8 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   }
 
   /**
-   * Overridable method called when the layer is in error and couldn't be loaded correctly
-   */
-  protected onError(): void {
-    // Set the layer config status to error to keep mirroring the AbstractGeoViewLayer for now
-    this.getLayerConfig().setLayerStatusError();
-  }
-
-  /**
-   * Overridable method called when the layer image is in error and couldn't be loaded correctly.
-   * We do not put the layer status as error, as this could be specific to a zoom level and the layer is otherwise fine.
-   */
-  protected onImageLoadError(): void {
-    // Log
-    logger.logError(
-      `Error loading source image for layer path: ${this.getLayerPath()} at zoom level: ${this.getMapViewer().getView().getZoom()}`
-    );
-
-    // Emit about the error
-    this.emitMessage('layers.errorImageLoad', [this.getLayerName()!, this.getMapViewer().getView().getZoom()!.toString()], 'error', true);
-  }
-
-  /**
    * Returns feature information for the layer specified.
+   * @param {OLMap} map - The Map to get feature info from.
    * @param {QueryType} queryType - The type of query to perform.
    * @param {TypeLocation} location - An pixel, coordinate or polygon that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
@@ -319,6 +418,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
    * @returns {Promise<TypeFeatureInfoEntry[]>} The feature info table.
    */
   async getFeatureInfo(
+    map: OLMap,
     queryType: QueryType,
     location: TypeLocation,
     queryGeometry: boolean = true,
@@ -330,7 +430,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
     // If the layer is not queryable
     if (layerConfig.source?.featureInfo?.queryable === false) {
       // Throw error
-      throw new GeoViewError(this.getMapId(), `Layer at path ${layerConfig.layerPath} is not queryable`);
+      throw new LayerNotQueryableError(layerConfig.layerPath, layerConfig.getLayerName());
     }
 
     // Log
@@ -344,23 +444,23 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
         promiseGetFeature = this.getAllFeatureInfo(abortController);
         break;
       case 'at_pixel':
-        promiseGetFeature = this.getFeatureInfoAtPixel(location as Pixel, queryGeometry, abortController);
+        promiseGetFeature = this.getFeatureInfoAtPixel(map, location as Pixel, queryGeometry, abortController);
         break;
       case 'at_coordinate':
-        promiseGetFeature = this.getFeatureInfoAtCoordinate(location as Coordinate, queryGeometry, abortController);
+        promiseGetFeature = this.getFeatureInfoAtCoordinate(map, location as Coordinate, queryGeometry, abortController);
         break;
       case 'at_long_lat':
-        promiseGetFeature = this.getFeatureInfoAtLongLat(location as Coordinate, queryGeometry, abortController);
+        promiseGetFeature = this.getFeatureInfoAtLongLat(map, location as Coordinate, queryGeometry, abortController);
         break;
       case 'using_a_bounding_box':
-        promiseGetFeature = this.getFeatureInfoUsingBBox(location as Coordinate[], queryGeometry, abortController);
+        promiseGetFeature = this.getFeatureInfoUsingBBox(map, location as Coordinate[], queryGeometry, abortController);
         break;
       case 'using_a_polygon':
-        promiseGetFeature = this.getFeatureInfoUsingPolygon(location as Coordinate[], queryGeometry, abortController);
+        promiseGetFeature = this.getFeatureInfoUsingPolygon(map, location as Coordinate[], queryGeometry, abortController);
         break;
       default:
         // Not implemented
-        throw new NotImplementedError();
+        throw new NotSupportedError(`Unsupported query type '${queryType}'`);
     }
 
     // Wait for results
@@ -378,7 +478,6 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   protected getAllFeatureInfo(
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     abortController: AbortController | undefined = undefined
@@ -389,31 +488,32 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
 
   /**
    * Overridable function to return of feature information at a given pixel location.
+   * @param {OLMap} map - The Map where to get Feature Info At Pixel from.
    * @param {Pixel} location - The pixel coordinate that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
   protected getFeatureInfoAtPixel(
+    map: OLMap,
     location: Pixel,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     queryGeometry: boolean = true,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     abortController: AbortController | undefined = undefined
   ): Promise<TypeFeatureInfoEntry[]> {
-    // Crash on purpose
-    throw new NotImplementedError(`getFeatureInfoAtPixel not implemented on layer path ${this.getLayerPath()}`);
+    // Redirect to getFeatureInfoAtCoordinate
+    return this.getFeatureInfoAtCoordinate(map, map.getCoordinateFromPixel(location), queryGeometry, abortController);
   }
 
   /**
    * Overridable function to return of feature information at a given coordinate.
+   * @param {OLMap} map - The Map where to get Feature Info At Coordinate from.
    * @param {Coordinate} location - The coordinate that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   protected getFeatureInfoAtCoordinate(
+    map: OLMap,
     location: Coordinate,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     queryGeometry: boolean = true,
@@ -426,13 +526,14 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
 
   /**
    * Overridable function to return of feature information at the provided long lat coordinate.
+   * @param {OLMap} map - The Map where to get Feature Info At LongLat from.
    * @param {Coordinate} lnglat - The coordinate that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   protected getFeatureInfoAtLongLat(
+    map: OLMap,
     lnglat: Coordinate,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     queryGeometry: boolean = true,
@@ -445,13 +546,14 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
 
   /**
    * Overridable function to return of feature information at the provided bounding box.
+   * @param {OLMap} map - The Map where to get Feature using BBox from.
    * @param {Coordinate} location - The bounding box that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   protected getFeatureInfoUsingBBox(
+    map: OLMap,
     location: Coordinate[],
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     queryGeometry: boolean = true,
@@ -464,6 +566,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
 
   /**
    * Overridable function to return of feature information at the provided polygon.
+   * @param {OLMap} map - The Map where to get Feature Info using Polygon from.
    * @param {Coordinate} location - The polygon that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
@@ -471,6 +574,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
    */
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   protected getFeatureInfoUsingPolygon(
+    map: OLMap,
     location: Coordinate[],
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     queryGeometry: boolean = true,
@@ -524,43 +628,17 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
         if (legend) {
           // Save the style according to the legend
           this.onSetStyleAccordingToLegend(legend);
-          // Check for possible number of icons and set icon cache size
-          this.updateIconImageCache(legend);
           // Emit legend information once retrieved
           this.#emitLegendQueried({ legend });
         }
       })
-      .catch((error) => {
+      .catch((error: unknown) => {
         // Log
         logger.logPromiseFailed('promiseLegend in queryLegend in AbstractGVLayer', error);
       });
 
     // Return the promise
     return promiseLegend;
-  }
-
-  /**
-   * Update the size of the icon image list based on styles.
-   * @param {TypeLegend} legend - The legend to check.
-   */
-  updateIconImageCache(legend: TypeLegend): void {
-    // GV This will need to be revised if functionality to add additional icons to a layer is added
-    let styleCount = this.getMapViewer().iconImageCacheSize;
-    if (legend.styleConfig)
-      Object.keys(legend.styleConfig).forEach((geometry) => {
-        if (
-          legend.styleConfig &&
-          (legend.styleConfig[geometry as TypeStyleGeometry]?.type === 'uniqueValue' ||
-            legend.styleConfig[geometry as TypeStyleGeometry]?.type === 'classBreaks')
-        ) {
-          if (legend.styleConfig[geometry as TypeStyleGeometry]!.info?.length)
-            styleCount += legend.styleConfig[geometry as TypeStyleGeometry]!.info.length;
-        }
-      });
-    // Set the openlayers icon image cache
-    iconImageCache.setSize(styleCount);
-    // Update the cache size for the map viewer
-    this.getMapViewer().iconImageCacheSize = styleCount;
   }
 
   /**
@@ -576,7 +654,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
         legend: await getLegendStyles(this.getStyle()),
       };
       return legend;
-    } catch (error) {
+    } catch (error: unknown) {
       // Log
       logger.logError(error);
       return null;
@@ -635,6 +713,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
       if (!features.length) return [];
 
       const outfields = layerConfig?.source?.featureInfo?.outfields;
+      const domainsLookup = layerConfig.getLayerMetadata()?.fields as TypeJsonArray | undefined;
 
       // Hold a dictionary built on the fly for the field domains
       const dictFieldDomains: { [fieldName: string]: codedValueType | rangeDomainType | null } = {};
@@ -662,7 +741,16 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
         if (layerStyle[geometryType]) {
           const styleSettings = layerStyle[geometryType]!;
           const { type } = styleSettings;
-          const featureStyle = processStyle[type][geometryType](styleSettings, feature, layerConfig.filterEquation, true, aliasLookup);
+
+          // Calculate the feature style
+          const featureStyle = processStyle[type][geometryType](
+            styleSettings,
+            feature,
+            layerConfig.filterEquation,
+            true,
+            domainsLookup,
+            aliasLookup
+          );
 
           // Sometimes data is not well fomrated and some features has no style associated, just throw a warning
           if (featureStyle === undefined) {
@@ -676,11 +764,19 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
 
           // Use string as dict key
           if (!imageSourceDict[styleString])
-            imageSourceDict[styleString] = getFeatureImageSource(feature, layerStyle, layerConfig.filterEquation, true, aliasLookup);
+            imageSourceDict[styleString] = getFeatureImageSource(
+              feature,
+              layerStyle,
+              layerConfig.filterEquation,
+              true,
+              domainsLookup,
+              aliasLookup
+            );
           imageSource = imageSourceDict[styleString];
         }
 
-        if (!imageSource) imageSource = getFeatureImageSource(feature, layerStyle, layerConfig.filterEquation, true, aliasLookup);
+        if (!imageSource)
+          imageSource = getFeatureImageSource(feature, layerStyle, layerConfig.filterEquation, true, domainsLookup, aliasLookup);
 
         let extent;
         if (feature.getGeometry()) extent = feature.getGeometry()!.getExtent();
@@ -746,7 +842,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
       });
 
       return queryResult;
-    } catch (error) {
+    } catch (error: unknown) {
       // Log
       logger.logError(error);
       return [];
@@ -780,6 +876,70 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
     if (layerConfig.initialSettings?.extent !== undefined) layerOptions.extent = layerConfig.initialSettings.extent;
     // eslint-disable-next-line no-param-reassign
     if (layerConfig.initialSettings?.states?.opacity !== undefined) layerOptions.opacity = layerConfig.initialSettings.states.opacity;
+  }
+
+  /**
+   * Extracts the relevant image, tile, or dispatching_ object from the event based on its structure.
+   * This method attempts to find the corresponding object (`image`, `tile`, or `dispatching_`) in the event.
+   * @param event - The event object, which could contain either an `image`, `tile`, or `dispatching_` property.
+   * @returns {unknown} - The extracted object (either image, tile, or dispatching_).
+   * @throws {NotImplementedError} - If the event doesn't match the expected structures.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  #findWrapperBetweenEventHandlers(event: unknown): any {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const eventAny = event as any;
+
+    if ('image' in eventAny) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return eventAny.image;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if ('tile' in eventAny) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any, no-underscore-dangle
+      return eventAny.tile;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if ('target' in eventAny && 'dispatching_' in eventAny.target) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any, no-underscore-dangle
+      return eventAny.target.dispatching_;
+    }
+
+    // Throw error
+    throw new NotImplementedError(`Not implemented event wrapper for layer ${this.getLayerPath()}`);
+  }
+
+  /**
+   * Starts a periodic timer that monitors the loading status of a layer.
+   * Every `DEFAULT_LOADING_PERIOD` milliseconds, it checks whether the layer is still loading. If so, it emits a warning message indicating
+   * that the rendering is taking longer than expected. The interval stops automatically when the layer finishes loading
+   * or encounters an error, or if a new loading process supersedes the current one (based on the loading counter).
+   * @param {number} loadingCounter - A unique counter representing the loading instance. Only the interval tied to the current
+   *                                  loading process will continue monitoring; outdated intervals will self-terminate.
+   */
+  #startLoadingPeriodWatcher(loadingCounter: number): void {
+    // Do the following thing until we stop it
+    doUntil(() => {
+      // This is the right interval that we want to be checking the layer status
+      const { layerStatus } = this.getLayerConfig();
+
+      // Check if the loadingCounter is different than our current counter (we're on the wrong timer for the loading checker)
+      if (this.loadingCounter !== loadingCounter) return true;
+
+      // If loaded or error, we're done
+      if (layerStatus === 'loaded' || layerStatus === 'error') return true;
+
+      // If still loading
+      if (layerStatus === 'loading') {
+        // Emit about the delay
+        this.emitMessage('warning.layer.slowRender', [this.getLayerName()]);
+      }
+
+      // Continue loop
+      return false;
+    }, AbstractGVLayer.DEFAULT_LOADING_PERIOD);
   }
 
   // #region EVENTS
@@ -896,31 +1056,87 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   }
 
   /**
-   * Emits an event to all handlers when the layer's features have been loaded on the map.
-   * @param {IndividualLayerLoadedEvent} event - The event to emit
+   * Emits an event to all handlers when a layer have been first loaded on the map.
+   * @param {LayerLoadEvent} event - The event to emit
    * @private
    */
-  #emitIndividualLayerLoaded(event: IndividualLayerLoadedEvent): void {
+  #emitLayerFirstLoaded(event: LayerLoadEvent): void {
     // Emit the event for all handlers
-    EventHelper.emitEvent(this, this.#onIndividualLayerLoadedHandlers, event);
+    EventHelper.emitEvent(this, this.#onLayerFirstLoadedHandlers, event);
   }
 
   /**
-   * Registers an individual layer loaded event handler.
-   * @param {IndividualLayerLoadedDelegate} callback - The callback to be executed whenever the event is emitted
+   * Registers when a layer have been first loaded on the map event handler.
+   * @param {LayerLoadDelegate} callback - The callback to be executed whenever the event is emitted
    */
-  onIndividualLayerLoaded(callback: IndividualLayerLoadedDelegate): void {
+  onLayerFirstLoaded(callback: LayerLoadDelegate): void {
     // Register the event handler
-    EventHelper.onEvent(this.#onIndividualLayerLoadedHandlers, callback);
+    EventHelper.onEvent(this.#onLayerFirstLoadedHandlers, callback);
   }
 
   /**
-   * Unregisters an individual layer loaded event handler.
-   * @param {IndividualLayerLoadedDelegate} callback - The callback to stop being called whenever the event is emitted
+   * Unregisters when a layer have been first loaded on the map event handler.
+   * @param {LayerLoadDelegate} callback - The callback to stop being called whenever the event is emitted
    */
-  offIndividualLayerLoaded(callback: IndividualLayerLoadedDelegate): void {
+  offLayerFirstLoaded(callback: LayerLoadDelegate): void {
     // Unregister the event handler
-    EventHelper.offEvent(this.#onIndividualLayerLoadedHandlers, callback);
+    EventHelper.offEvent(this.#onLayerFirstLoadedHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers when a layer is turning into a loading stage on the map.
+   * @param {LayerLoadEvent} event - The event to emit
+   * @private
+   */
+  #emitLayerLoading(event: LayerLoadEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerLoadingHandlers, event);
+  }
+
+  /**
+   * Registers when a layer is turning into a loading stage event handler.
+   * @param {LayerLoadDelegate} callback - The callback to be executed whenever the event is emitted
+   */
+  onLayerLoading(callback: LayerLoadDelegate): void {
+    // Register the event handler
+    EventHelper.onEvent(this.#onLayerLoadingHandlers, callback);
+  }
+
+  /**
+   * Unregisters when a layer is turning into a loading stage event handler.
+   * @param {LayerLoadDelegate} callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerLoading(callback: LayerLoadDelegate): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerLoadingHandlers, callback);
+  }
+
+  /**
+   * Emits an event to all handlers when a layer is turning into a loaded stage on the map.
+   * @param {LayerLoadEvent} event - The event to emit
+   * @private
+   */
+  #emitLayerLoaded(event: LayerLoadEvent): void {
+    // Emit the event for all handlers
+    EventHelper.emitEvent(this, this.#onLayerLoadedHandlers, event);
+  }
+
+  /**
+   * Registers when a layer is turning into a loaded stage event handler.
+   * @param {LayerLoadDelegate} callback - The callback to be executed whenever the event is emitted
+   */
+  onLayerLoaded(callback: LayerLoadDelegate): void {
+    // Register the event handler
+    EventHelper.onEvent(this.#onLayerLoadedHandlers, callback);
+  }
+
+  /**
+   * Unregisters when a layer is turning into a loaded stage event handler.
+   * @param {LayerLoadDelegate} callback - The callback to stop being called whenever the event is emitted
+   */
+  offLayerLoaded(callback: LayerLoadDelegate): void {
+    // Unregister the event handler
+    EventHelper.offEvent(this.#onLayerLoadedHandlers, callback);
   }
 
   /**
@@ -934,7 +1150,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   }
 
   /**
-   * Registers an individual layer message event handler.
+   * Registers a layer message event handler.
    * @param {LayerMessageEventDelegate} callback - The callback to be executed whenever the event is emitted
    */
   onLayerMessage(callback: LayerMessageDelegate): void {
@@ -943,7 +1159,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
   }
 
   /**
-   * Unregisters an individual layer message event handler.
+   * Unregisters a layer message event handler.
    * @param {LayerMessageEventDelegate} callback - The callback to stop being called whenever the event is emitted
    */
   offLayerMessage(callback: LayerMessageDelegate): void {
@@ -957,7 +1173,7 @@ export abstract class AbstractGVLayer extends AbstractBaseLayer {
 /**
  * Define a delegate for the event handler function signature
  */
-type LayerStyleChangedDelegate = EventDelegateBase<AbstractGVLayer, LayerStyleChangedEvent, void>;
+export type LayerStyleChangedDelegate = EventDelegateBase<AbstractGVLayer, LayerStyleChangedEvent, void>;
 
 /**
  * Define an event for the delegate
@@ -975,7 +1191,7 @@ export type LegendQueryingEvent = unknown;
 /**
  * Define a delegate for the event handler function signature
  */
-type LegendQueryingDelegate = EventDelegateBase<AbstractGVLayer, LegendQueryingEvent, void>;
+export type LegendQueryingDelegate = EventDelegateBase<AbstractGVLayer, LegendQueryingEvent, void>;
 
 /**
  * Define an event for the delegate
@@ -987,12 +1203,12 @@ export type LegendQueriedEvent = {
 /**
  * Define a delegate for the event handler function signature
  */
-type LegendQueriedDelegate = EventDelegateBase<AbstractGVLayer, LegendQueriedEvent, void>;
+export type LegendQueriedDelegate = EventDelegateBase<AbstractGVLayer, LegendQueriedEvent, void>;
 
 /**
  * Define a delegate for the event handler function signature
  */
-type LayerFilterAppliedDelegate = EventDelegateBase<AbstractGVLayer, LayerFilterAppliedEvent, void>;
+export type LayerFilterAppliedDelegate = EventDelegateBase<AbstractGVLayer, LayerFilterAppliedEvent, void>;
 
 /**
  * Define an event for the delegate
@@ -1005,12 +1221,12 @@ export type LayerFilterAppliedEvent = {
 /**
  * Define a delegate for the event handler function signature
  */
-type IndividualLayerLoadedDelegate = EventDelegateBase<AbstractGVLayer, IndividualLayerLoadedEvent, void>;
+export type LayerLoadDelegate = EventDelegateBase<AbstractGVLayer, LayerLoadEvent, void>;
 
 /**
  * Define an event for the delegate
  */
-export type IndividualLayerLoadedEvent = {
+export type LayerLoadEvent = {
   // The loaded layer
   layerPath: string;
 };
@@ -1018,7 +1234,7 @@ export type IndividualLayerLoadedEvent = {
 /**
  * Define a delegate for the event handler function signature
  */
-type LayerMessageDelegate = EventDelegateBase<AbstractGVLayer, LayerMessageEvent, void>;
+export type LayerMessageDelegate = EventDelegateBase<AbstractGVLayer, LayerMessageEvent, void>;
 
 /**
  * Define an event for the delegate

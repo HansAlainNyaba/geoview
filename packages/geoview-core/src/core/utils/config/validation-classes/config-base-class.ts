@@ -1,7 +1,7 @@
 import EventHelper, { EventDelegateBase } from '@/api/events/event-helper';
-import { TypeGeoviewLayerType } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
 import {
   TypeGeoviewLayerConfig,
+  TypeGeoviewLayerType,
   TypeLayerEntryType,
   TypeLayerInitialSettings,
   TypeLayerStatus,
@@ -12,6 +12,7 @@ import { TypeJsonObject } from '@/api/config/types/config-types';
 import { LAYER_STATUS } from '@/core/utils/constant';
 import { GroupLayerEntryConfig } from './group-layer-entry-config';
 import { NotImplementedError } from '@/core/exceptions/core-exceptions';
+import { DateMgt, TypeDateFragments } from '@/core/utils/date-mgt';
 
 /**
  * Base type used to define a GeoView layer to display on the map. Unless specified,its properties are not part of the schema.
@@ -149,6 +150,41 @@ export abstract class ConfigBaseClass {
   }
 
   /**
+   * Gets the layer name of the entry layer or
+   * fallbacks on the geoviewLayerName from the GeoViewLayerConfig or
+   * fallbacks on the geoviewLayerId from the GeoViewLayerConfig or
+   * fallsback on the layerPath.
+   */
+  getLayerName(): string {
+    return this.layerName || this.geoviewLayerConfig.geoviewLayerName || this.geoviewLayerConfig.geoviewLayerId || this.layerPath;
+  }
+
+  /**
+   * Returns the sibling layer configurations of the current layer.
+   * If the current layer has a parent, this method retrieves all layer entry
+   * configs under the same parent. It can optionally exclude layers of type 'group'.
+   * @param {boolean} includeGroups - Whether to include entries of type 'group' in the result. False by default.
+   * @returns {ConfigBaseClass[]} An array of sibling layer configurations. Returns an empty array if there is no parent.
+   */
+  getSiblings(includeGroups: boolean = false): ConfigBaseClass[] {
+    // If there's a parent
+    if (this.parentLayerConfig) {
+      return this.parentLayerConfig.listOfLayerEntryConfig.filter((config) => includeGroups || config.entryType !== 'group');
+    }
+
+    // No siblings
+    return [];
+  }
+
+  /**
+   * Gets the external fragments order if specified by the config, defaults to ISO_UTC.
+   * @returns {TypeDateFragments} The Date Fragments
+   */
+  getExternalFragmentsOrder(): TypeDateFragments {
+    return DateMgt.getDateFragmentsOrder(this.geoviewLayerConfig.externalDateFormat);
+  }
+
+  /**
    * Sets the layer status to registered.
    */
   setLayerStatusRegistered(): void {
@@ -202,13 +238,13 @@ export abstract class ConfigBaseClass {
    */
   setLayerStatus(newLayerStatus: TypeLayerStatus): void {
     // Log
-    logger.logDebug('LAYERS STATUS -', this.layerPath, newLayerStatus);
+    logger.logTraceCore('LAYERS STATUS -', this.layerPath, newLayerStatus);
 
     // GV For quick debug, uncomment the line
     // if (newLayerStatus === 'error') debugger;
 
-    // Check if we're not accidentally trying to set a status less than the current one
-    if (!this.isGreaterThanOrEqualTo(newLayerStatus)) {
+    // Check if we're not accidentally trying to set a status less than the current one (or setting loading, it's allowed to jump between loading and loaded)
+    if (!this.isGreaterThanOrEqualTo(newLayerStatus) || newLayerStatus === 'loading') {
       // eslint-disable-next-line no-underscore-dangle
       this._layerStatus = newLayerStatus;
 
@@ -239,6 +275,70 @@ export abstract class ConfigBaseClass {
   }
 
   /**
+   * Updates the status of all parents layers based on the status of their sibling layers.
+   * This method checks the statuses of sibling layers (layers sharing the same parent).
+   * - If at least one sibling is in a 'loading' state, it sets the parent layer status to 'loading'.
+   * - If all siblings are in a 'loaded' state, it sets the parent layer status to 'loaded'.
+   * - If all siblings are in an 'error' state, it sets the parent layer status to 'error'.
+   * - If neither condition is met, the parent status remains unchanged.
+   */
+  updateLayerStatusParent(): void {
+    // Redirect
+    ConfigBaseClass.#updateLayerStatusParentRec(this);
+  }
+
+  /**
+   * Recursively updates the status of the parent layer based on the status of its sibling layers.
+   * This method checks the statuses of sibling layers (layers sharing the same parent).
+   * - If at least one sibling is in a 'loading' state, it sets the parent layer status to 'loading'.
+   * - If all siblings are in a 'loaded' state, it sets the parent layer status to 'loaded'.
+   * - If all siblings are in an 'error' state, it sets the parent layer status to 'error'.
+   * - If neither condition is met, the parent status remains unchanged.
+   */
+  static #updateLayerStatusParentRec(currentConfig: ConfigBaseClass): void {
+    // If there's no parent
+    if (!currentConfig.parentLayerConfig) return;
+
+    // Get all siblings of the layer
+    const siblings = currentConfig.getSiblings(true);
+
+    // Get all siblings which are in loading state
+    const siblingsInLoading = siblings.filter((lyrConfig) => lyrConfig.layerStatus === 'loading');
+
+    // If at least one layer is loading
+    if (siblingsInLoading.length > 0) {
+      // Set the parent layer status as loaded
+      currentConfig.parentLayerConfig.setLayerStatusLoading();
+      // Continue with the parent
+      ConfigBaseClass.#updateLayerStatusParentRec(currentConfig.parentLayerConfig);
+      return;
+    }
+
+    // Get all siblings which are in loaded
+    const siblingsInLoaded = siblings.filter((lyrConfig) => lyrConfig.layerStatus === 'loaded');
+
+    // If all siblings are loaded
+    if (siblings.length === siblingsInLoaded.length) {
+      // Set the parent layer status as loaded
+      currentConfig.parentLayerConfig.setLayerStatusLoaded();
+      // Continue with the parent
+      ConfigBaseClass.#updateLayerStatusParentRec(currentConfig.parentLayerConfig);
+      return;
+    }
+
+    // Get all siblings which are in error
+    const siblingsInError = siblings.filter((lyrConfig) => lyrConfig.layerStatus === 'error');
+
+    // If all siblings are in fact in error
+    if (siblings.length === siblingsInError.length) {
+      // Set the parent layer status as error
+      currentConfig.parentLayerConfig.setLayerStatusError();
+      // Continue with the parent
+      ConfigBaseClass.#updateLayerStatusParentRec(currentConfig.parentLayerConfig);
+    }
+  }
+
+  /**
    * Getter for the layer Path of the layer configuration parameter.
    * @param {ConfigBaseClass} layerConfig - The layer configuration for which we want to get the layer path.
    * @param {string} layerPath - Internal parameter used to build the layer path (should not be used by the user).
@@ -250,7 +350,7 @@ export abstract class ConfigBaseClass {
     if (pathEnding === undefined)
       pathEnding =
         layerConfig.layerIdExtension === undefined ? layerConfig.layerId : `${layerConfig.layerId}.${layerConfig.layerIdExtension}`;
-    if (!layerConfig.parentLayerConfig) return `${layerConfig.geoviewLayerConfig!.geoviewLayerId!}/${pathEnding}`;
+    if (!layerConfig.parentLayerConfig) return `${layerConfig.geoviewLayerConfig.geoviewLayerId}/${pathEnding}`;
     return this.#evaluateLayerPath(
       layerConfig.parentLayerConfig as GroupLayerEntryConfig,
       `${(layerConfig.parentLayerConfig as GroupLayerEntryConfig).layerId}/${pathEnding}`
@@ -365,7 +465,7 @@ export abstract class ConfigBaseClass {
 /**
  * Define a delegate for the event handler function signature.
  */
-type LayerStatusChangedDelegate = EventDelegateBase<ConfigBaseClass, LayerStatusChangedEvent, void>;
+export type LayerStatusChangedDelegate = EventDelegateBase<ConfigBaseClass, LayerStatusChangedEvent, void>;
 
 /**
  * Define an event for the delegate.

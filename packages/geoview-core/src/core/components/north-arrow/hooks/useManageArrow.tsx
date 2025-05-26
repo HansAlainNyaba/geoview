@@ -12,12 +12,13 @@ import {
   useMapZoom,
 } from '@/core/stores/store-interface-and-intial-values/map-state';
 import { logger } from '@/core/utils/logger';
-import { CV_MAP_CENTER } from '@/api/config/types/config-constants';
 
 interface ArrowReturn {
   rotationAngle: { angle: number };
   northOffset: number;
 }
+
+const CENTRAL_MERIDIAN = -92;
 
 /**
  * Custom hook to Manage North arrow (rotation and offset) and update store state.
@@ -54,6 +55,11 @@ export const useManageArrow = (): ArrowReturn => {
     // Log
     logger.logTraceUseMemo('USE-MANAGE-ARROW - calculatedRotation, calculatedOffset');
 
+    // Constants
+    const ARROW_WIDTH = 24;
+    const mapWidth = mapSize[0] / 2;
+    const offsetX = mapWidth - ARROW_WIDTH / 2;
+
     // Early return if no arrow element
     if (!northArrowElement) {
       return { calculatedRotation: { angle: 0 }, calculatedOffset: 0 };
@@ -64,10 +70,11 @@ export const useManageArrow = (): ArrowReturn => {
       return { calculatedRotation: { angle: 0 }, calculatedOffset: 0 };
     }
 
-    // Constants
-    const ARROW_WIDTH = 24;
-    const mapWidth = mapSize[0] / 2;
-    const offsetX = mapWidth - ARROW_WIDTH / 2;
+    // Early return if zoom level is smaller the 5 and map center is near central meridian (keep rotation to 0)
+    const mapCenterLongitude: number = Projection.transformCoordinates(mapCenterCoord, 'EPSG:3978', 'EPSG:4326')![0] as number;
+    if (mapZoom < 5 && Math.abs(CENTRAL_MERIDIAN - mapCenterLongitude) < 10) {
+      return { calculatedRotation: { angle: 0 }, calculatedOffset: offsetX };
+    }
 
     // Handle Web Mercator Projection - simpler case first
     if (isWebMercator) {
@@ -97,9 +104,7 @@ export const useManageArrow = (): ArrowReturn => {
         const diff = Math.abs(mapRotation - rotationValue);
 
         // Calculate longitude factor
-        const CENTRAL_MERIDIAN = -97; // CV_MAP_CENTER[3978][0];
-        const centerLongitude = Projection.transformCoordinates(mapCenterCoord, 'EPSG:3978', 'EPSG:4326')![0];
-        const deviationFromCenter = (centerLongitude as number) - CENTRAL_MERIDIAN;
+        const deviationFromCenter = (mapCenterLongitude as number) - CENTRAL_MERIDIAN;
 
         if (Math.abs(deviationFromCenter) <= 3) {
           setRotation(0);
@@ -140,8 +145,7 @@ export const useManageArrow = (): ArrowReturn => {
         const MAX_DISTANCE = 10000; // Maximum meaningful distance from north pole
         const distanceFactor = Math.min(distanceFromNorthPole / MAX_DISTANCE, 1);
 
-        // Calculate longitude factor (-90° is center, increases towards -150° and -30°)
-        const CENTRAL_MERIDIAN = CV_MAP_CENTER[3978][0];
+        // Calculate longitude factor (-92° is center, increases towards -150° and -30°)
         const centerLongitude = mapCenterCoord[0];
         const deviationFromCenter = centerLongitude - CENTRAL_MERIDIAN;
         const longitudeFactor = Math.min(Math.abs(deviationFromCenter) / 60, 1); // 60° range to max

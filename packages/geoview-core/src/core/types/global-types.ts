@@ -10,12 +10,13 @@ import { useWhatChanged } from '@/core/utils/useWhatChanged';
 import * as UI from '@/ui';
 import { AbstractPlugin } from '@/api/plugin/abstract-plugin';
 import { TypeJsonObject } from '@/api/config/types/config-types';
+import { MapViewer } from '@/geo/map/map-viewer';
 
 export { getGeoViewStore } from '@/core/stores/stores-managers';
 
 export type { SelectChangeEvent } from '@mui/material';
 
-/** ******************************************************************************************************************************
+/**
  * Definition of the map feature configuration according to what can be specified in the map div and in the schema for the
  * type extension TypeMapFeaturesInstance.
  */
@@ -26,7 +27,7 @@ export interface TypeMapFeaturesConfig extends TypeMapFeaturesInstance {
   displayLanguage?: TypeDisplayLanguage;
 }
 
-/** ******************************************************************************************************************************
+/**
  *  Definition of a global Window type.
  */
 declare global {
@@ -36,7 +37,7 @@ declare global {
   }
 }
 
-/** ******************************************************************************************************************************
+/**
  * Type extending the window object.
  */
 export interface TypeWindow extends Window {
@@ -54,15 +55,15 @@ export interface TypeWindow extends Window {
   };
 }
 
-/** ******************************************************************************************************************************
+/**
  * Type used for exporting core.
  */
 export type TypeCGPV = {
-  init: CGPVInitCallback;
-  onMapInit: CGPVCallback;
-  onMapReady: CGPVCallback;
-  onLayersProcessed: CGPVCallback;
-  onLayersLoaded: CGPVCallback;
+  init: () => void;
+  onMapInit: MapViewerCallback;
+  onMapReady: MapViewerCallback;
+  onLayersProcessed: MapViewerCallback;
+  onLayersLoaded: MapViewerCallback;
   api: API;
   react: typeof React;
   createRoot: typeof createRoot;
@@ -70,13 +71,13 @@ export type TypeCGPV = {
   logger: typeof logger;
 };
 
-/** ******************************************************************************************************************************
- * Type used for a callback function.
- */
-export type CGPVInitCallback = (callbackMapsInit?: (mapId: string) => void, callbackMapsLayersLoaded?: (mapId: string) => void) => void;
-export type CGPVCallback = (callback: (mapId: string) => void) => void;
+/** MapViewer delegate */
+export type MapViewerDelegate = (mapViewer: MapViewer) => void;
 
-/** ******************************************************************************************************************************
+/** CGPV MapViewer callback delegate */
+export type MapViewerCallback = (callback: MapViewerDelegate) => void;
+
+/**
  * Type used for exporting UI
  */
 export type TypeCGPVUI = {
@@ -86,7 +87,7 @@ export type TypeCGPVUI = {
   elements: typeof UI;
 };
 
-/** ******************************************************************************************************************************
+/**
  *  Definition of an extended HTML element type.
  */
 export interface TypeHTMLElement extends HTMLElement {
@@ -95,7 +96,7 @@ export interface TypeHTMLElement extends HTMLElement {
   mozRequestFullScreen: () => void;
 }
 
-/** ******************************************************************************************************************************
+/**
  *  Definition of an Container where components are rendered.
  */
 export type TypeContainerBox = 'appBar' | 'footerBar';

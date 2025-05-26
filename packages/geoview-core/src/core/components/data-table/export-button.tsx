@@ -18,6 +18,9 @@ interface ExportButtonProps {
   children?: ReactElement | undefined;
 }
 
+/** The columns to remove from the data when exporting */
+const COLUMNS_TO_REMOVE = ['ICON', 'ZOOM', 'DETAILS', 'geoviewID'];
+
 /**
  * Custom  export button which will help to download data table data in csv format.
  * @param {string} layerPath id of the layer
@@ -65,7 +68,7 @@ function ExportButton({ layerPath, rows, columns, children }: ExportButtonProps)
     logger.logTraceUseMemo('DATA-TABLE - EXPORT BUTTON - getCsvOptions', columns);
 
     // Remove the utility columns
-    const filteredColumns = columns.filter((col) => !['ICON', 'ZOOM', 'DETAILS', 'geoviewID'].includes(col.id as string));
+    const filteredColumns = columns.filter((col) => !COLUMNS_TO_REMOVE.includes(col.id as string));
 
     return (): Options => ({
       filename: `table-${getLayer(layerPath)?.layerName.replaceAll(' ', '-')}`,
@@ -90,7 +93,10 @@ function ExportButton({ layerPath, rows, columns, children }: ExportButtonProps)
     const csvRows = rows.map((row) => {
       const mappedRow = Object.keys(row).reduce(
         (acc, curr) => {
-          acc[curr] = row[curr]?.value ?? '';
+          // Only add the field if it's not a utility column
+          if (!COLUMNS_TO_REMOVE.includes(curr)) {
+            acc[curr] = row[curr]?.value ?? '';
+          }
           return acc;
         },
         {} as Record<string, unknown>

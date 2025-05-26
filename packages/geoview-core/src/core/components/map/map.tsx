@@ -1,7 +1,9 @@
-import { useEffect, useRef, useCallback, MutableRefObject, useMemo } from 'react';
+import { useEffect, useRef, useCallback, MutableRefObject, useMemo, useState } from 'react';
 
 import { Box, useMediaQuery } from '@mui/material';
 import { useTheme } from '@mui/material/styles';
+
+import { ProgressBar } from '@/ui';
 
 import { NorthArrow, NorthPoleFlag } from '@/core/components/north-arrow/north-arrow';
 import { Crosshair } from '@/core/components/crosshair/crosshair';
@@ -17,6 +19,7 @@ import { useGeoViewConfig, useGeoViewMapId } from '@/core/stores/geoview-store';
 import { Plugin } from '@/api/plugin/plugin';
 import { logger } from '@/core/utils/logger';
 import { toJsonObject } from '@/api/config/types/config-types';
+import { useLayersAreLoading } from '@/core/stores/store-interface-and-intial-values/layer-state';
 
 type MapProps = {
   viewer: MapViewer;
@@ -47,8 +50,13 @@ export function Map(props: MapProps): JSX.Element {
   const northArrow = useMapNorthArrow();
   const mapLoaded = useMapLoaded();
   const mapStoreConfig = useGeoViewConfig();
+  const layersAreLoading = useLayersAreLoading();
+
   // flag to check if map is initialized. we added to prevent double rendering in StrictMode
   const isMapInitialized = useRef<boolean>(false);
+  const [isMapReady, setIsMapReady] = useState(false);
+
+  const hasRun = useRef(false);
 
   const initCGPVMap = useCallback((): void => {
     // Log
@@ -67,31 +75,42 @@ export function Map(props: MapProps): JSX.Element {
               mapId,
               viewer,
             })
-          ).catch((error) => {
+          ).catch((error: unknown) => {
             // Log
             logger.logPromiseFailed('api.plugin.addPlugin in useCallback in map', error);
           });
         })
-        .catch((error) => {
+        .catch((error: unknown) => {
           // Log
           logger.logPromiseFailed('api.plugin.addPlugin in useCallback in map', error);
         });
     });
   }, [mapId, mapStoreConfig?.corePackages, viewer]);
 
-  useEffect((): void => {
-    // Log
-    logger.logTraceUseEffect('map.initMap');
+  useEffect(() => {
+    logger.logTraceUseEffect('MAP - initCGPVMap');
 
-    // check if map is initialized and if not, initialize it
-    if (!isMapInitialized.current) {
-      // Init the map on first render
-      viewer.createMap(mapElement.current!);
+    // FIXME: Here, we're preventing a double run, because at this level it's not only impacting a rendering thing, it's impacting the core
+    // FIX.MECONT: and raising double mapReady events which doesn't make sense.
+    // FIX.MECONT: The core of the issue is that the map creation shouldn't be happening inside a 'useEffect' hook, which is a UI thing.
+    // Prevent double run, due to React's StrictMode in dev.
+    if (hasRun.current) return;
+    hasRun.current = true;
+
+    if (mapElement.current && !isMapReady && !isMapInitialized.current) {
+      // Create map
+      viewer.createMap(mapElement.current);
+
+      // Listen for map ready event which includes proper extent
+      viewer.onMapReady(() => {
+        // Map is fully initialized with proper extent
+        setIsMapReady(true);
+      });
 
       initCGPVMap();
       isMapInitialized.current = true;
     }
-  }, [initCGPVMap, viewer]);
+  }, [viewer, initCGPVMap, isMapReady]);
 
   return (
     // ? the map is focusable and needs to be tabbable for keyboard navigation
@@ -106,6 +125,11 @@ export function Map(props: MapProps): JSX.Element {
           <HoverTooltip />
           {deviceSizeMedUp && overviewMap && viewer.map && <OverviewMap />}
         </>
+      )}
+      {layersAreLoading && (
+        <Box sx={sxClasses.progressBar}>
+          <ProgressBar />
+        </Box>
       )}
     </Box>
   );

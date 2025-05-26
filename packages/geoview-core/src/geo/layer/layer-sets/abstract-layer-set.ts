@@ -1,3 +1,5 @@
+import { Map as OLMap } from 'ol';
+
 import EventHelper, { EventDelegateBase } from '@/api/events/event-helper';
 import {
   QueryType,
@@ -10,14 +12,18 @@ import {
   TypeResultSetEntry,
 } from '@/api/config/types/map-schema-types';
 import { generateId, whenThisThen } from '@/core/utils/utilities';
-import { ConfigBaseClass, LayerStatusChangedEvent } from '@/core/utils/config/validation-classes/config-base-class';
+import {
+  ConfigBaseClass,
+  LayerStatusChangedDelegate,
+  LayerStatusChangedEvent,
+} from '@/core/utils/config/validation-classes/config-base-class';
 import { AbstractBaseLayerEntryConfig } from '@/core/utils/config/validation-classes/abstract-base-layer-entry-config';
 import { LayerApi } from '@/geo/layer/layer';
 import { AbstractGVLayer } from '@/geo/layer/gv-layers/abstract-gv-layer';
 import { GVEsriDynamic } from '@/geo/layer/gv-layers/raster/gv-esri-dynamic';
 import { AbstractGVVector } from '@/geo/layer/gv-layers/vector/abstract-gv-vector';
 import { GVWMS } from '@/geo/layer/gv-layers/raster/gv-wms';
-import { AbstractBaseLayer, LayerNameChangedEvent } from '@/geo/layer/gv-layers/abstract-base-layer';
+import { AbstractBaseLayer, LayerNameChangedDelegate, LayerNameChangedEvent } from '@/geo/layer/gv-layers/abstract-base-layer';
 import { logger } from '@/core/utils/logger';
 
 /**
@@ -46,10 +52,10 @@ export abstract class AbstractLayerSet {
   #onLayerStatusUpdatedHandlers: LayerStatusUpdatedDelegate[] = [];
 
   // Keep a bounded reference to the handle layer status changed
-  #boundHandleLayerStatusChanged: (config: ConfigBaseClass, layerStatusEvent: LayerStatusChangedEvent) => void;
+  #boundedHandleLayerStatusChanged: LayerStatusChangedDelegate;
 
   // Keep a bounded reference to the handle layer status changed
-  #boundHandleLayerNameChanged: (layer: AbstractBaseLayer, layerNameEvent: LayerNameChangedEvent) => void;
+  #boundedHandleLayerNameChanged: LayerNameChangedDelegate;
 
   /**
    * Constructs a new LayerSet instance.
@@ -57,8 +63,8 @@ export abstract class AbstractLayerSet {
    */
   constructor(layerApi: LayerApi) {
     this.layerApi = layerApi;
-    this.#boundHandleLayerStatusChanged = this.#handleLayerStatusChanged.bind(this);
-    this.#boundHandleLayerNameChanged = this.#handleLayerNameChanged.bind(this);
+    this.#boundedHandleLayerStatusChanged = this.#handleLayerStatusChanged.bind(this);
+    this.#boundedHandleLayerNameChanged = this.#handleLayerNameChanged.bind(this);
   }
 
   /**
@@ -126,28 +132,30 @@ export abstract class AbstractLayerSet {
         if (layerConfig.layerStatus === 'loaded') {
           // The layer has become loaded
 
-          // GV Take this opportunity to verify if the layer had a parent (this code used to be inside ConfigBaseClass,
-          // GV but it turns out parentLayerConfig couldn't be trusted when navigating the object hierarchy - see note over there)
-          // GV cgpv.api.getMapViewer('sandboxMap').layer.getLayerEntryConfig('uniqueValueId/uniqueValueId/4').layerStatus
-          // GV vs cgpv.api.getMapVierwer('sandboxMap').layer.getLayerEntryConfig('uniqueValueId/uniqueValueId/4').parentLayerConfig.listOfLayerEntryConfig[0].layerStatus
+          // TODO: Cleanup - Commenting this for now (2025-05-16) to see how things behave.
+          // TO.DOCONT: I don't think it's necessary anymore with the dynamic onLoading, onLoaded now changing the status on-the-fly more
+          // // GV Take this opportunity to verify if the layer had a parent (this code used to be inside ConfigBaseClass,
+          // // GV but it turns out parentLayerConfig couldn't be trusted when navigating the object hierarchy - see note over there)
+          // // GV cgpv.api.getMapViewer('sandboxMap').layer.getLayerEntryConfig('uniqueValueId/uniqueValueId/4').layerStatus
+          // // GV vs cgpv.api.getMapVierwer('sandboxMap').layer.getLayerEntryConfig('uniqueValueId/uniqueValueId/4').parentLayerConfig.listOfLayerEntryConfig[0].layerStatus
 
-          // If the config has a parent
-          if (layerConfig.parentLayerConfig) {
-            // Get all the siblings reusing the LayerApi which is more trustable than the parent hierarchy on the config themselves
-            const layerConfigSiblings = layerConfig.parentLayerConfig.listOfLayerEntryConfig
-              .map((layerConf) => {
-                return this.layerApi.getLayerEntryConfig(layerConf.layerPath);
-              })
-              .filter((layerConf) => layerConf) as ConfigBaseClass[];
+          // // If the config has a parent
+          // if (layerConfig.parentLayerConfig) {
+          //   // Get all the siblings reusing the LayerApi which is more trustable than the parent hierarchy on the config themselves
+          //   const layerConfigSiblings = layerConfig.parentLayerConfig.listOfLayerEntryConfig
+          //     .map((layerConf) => {
+          //       return this.layerApi.getLayerEntryConfig(layerConf.layerPath);
+          //     })
+          //     .filter((layerConf) => layerConf) as ConfigBaseClass[];
 
-            // If all siblings of the layer config are loaded
-            if (ConfigBaseClass.allLayerStatusAreGreaterThanOrEqualTo('loaded', layerConfigSiblings)) {
-              // Get the parent, again using the LayerApi, can't trust the 'parentLayerConfig'
-              const parentConfig = this.layerApi.getLayerEntryConfig(layerConfig.parentLayerConfig.layerPath);
-              // If found, this parent can be flagged as loaded
-              if (parentConfig) parentConfig.setLayerStatusLoaded();
-            }
-          }
+          //   // If all siblings of the layer config are loaded
+          //   if (ConfigBaseClass.allLayerStatusAreGreaterThanOrEqualTo('loaded', layerConfigSiblings)) {
+          //     // Get the parent, again using the LayerApi, can't trust the 'parentLayerConfig'
+          //     const parentConfig = this.layerApi.getLayerEntryConfig(layerConfig.parentLayerConfig.layerPath);
+          //     // If found, this parent can be flagged as loaded
+          //     if (parentConfig) parentConfig.setLayerStatusLoaded();
+          //   }
+          // }
 
           // Get the layer
           const layer = this.layerApi.getGeoviewLayer(layerConfig.layerPath);
@@ -155,7 +163,7 @@ export abstract class AbstractLayerSet {
           // If the layer could be found
           if (layer) {
             // Register the layer itself (not the layer config) automatically in the layer set
-            this.registerLayer(layer).catch((error) => {
+            this.registerLayer(layer).catch((error: unknown) => {
               // Log
               logger.logPromiseFailed('in registerLayer in registerLayerConfig', error);
             });
@@ -164,7 +172,7 @@ export abstract class AbstractLayerSet {
 
         // Emit that the layerConfig got their status changed
         this.#emitLayerStatusUpdated({ layer: layerConfig });
-      } catch (error) {
+      } catch (error: unknown) {
         // Error happened when trying to register the layer coming from the layer config
         logger.logError('Error trying to register the layer coming from the layer config', error);
       }
@@ -198,20 +206,21 @@ export abstract class AbstractLayerSet {
     };
 
     // Register the layer status changed handler
-    layerConfig.onLayerStatusChanged(this.#boundHandleLayerStatusChanged);
+    layerConfig.onLayerStatusChanged(this.#boundedHandleLayerStatusChanged);
   }
 
   /**
    * Registers the layer in the layer-set.
-   * @param {AbstractBaseLayer} layer - The layer
+   * If the layer is already registered, the function returns immediately.
+   * @param {AbstractBaseLayer} layer - The layer to register
    */
   async registerLayer(layer: AbstractBaseLayer): Promise<void> {
+    // If the layer is already registered, skip it, we don't register twice
+    if (this.getRegisteredLayerPaths().includes(layer.getLayerPath())) return;
+
     // Wait a maximum of 20 seconds for the layer to get to loaded state so that it can get registered, otherwise another attempt will have to be made
     // This await is important when devs call this method directly to register ad-hoc layers.
     await whenThisThen(() => layer.getLayerStatus() === 'loaded', 20000);
-
-    // If the layer is already registered, skip it, we don't register twice
-    if (this.getRegisteredLayerPaths().includes(layer.getLayerPath())) return;
 
     // Update the registration of all layer sets
     if (this.onRegisterLayerCheck(layer)) {
@@ -253,7 +262,7 @@ export abstract class AbstractLayerSet {
    */
   protected onRegisterLayer(layer: AbstractBaseLayer): void {
     // Get layer name
-    const layerName = layer.getLayerName()!;
+    const layerName = layer.getLayerName();
     const layerPath = layer.getLayerPath();
 
     // If not there (wasn't pre-registered via a config-registration)
@@ -273,7 +282,7 @@ export abstract class AbstractLayerSet {
     this.#registeredLayers.push(layer);
 
     // Register the layer name changed handler
-    layer.onLayerNameChanged(this.#boundHandleLayerNameChanged);
+    layer.onLayerNameChanged(this.#boundedHandleLayerNameChanged);
   }
 
   /**
@@ -307,7 +316,7 @@ export abstract class AbstractLayerSet {
    */
   protected onUnregisterLayerConfig(layerConfig: ConfigBaseClass | undefined): void {
     // Unregister the layer status changed handler
-    layerConfig?.offLayerStatusChanged(this.#boundHandleLayerStatusChanged);
+    layerConfig?.offLayerStatusChanged(this.#boundedHandleLayerStatusChanged);
   }
 
   /**
@@ -317,7 +326,7 @@ export abstract class AbstractLayerSet {
    */
   protected onUnregisterLayer(layer: AbstractBaseLayer | undefined): void {
     // Unregister the layer name changed handler
-    layer?.offLayerNameChanged(this.#boundHandleLayerNameChanged);
+    layer?.offLayerNameChanged(this.#boundedHandleLayerNameChanged);
   }
 
   /**
@@ -332,13 +341,13 @@ export abstract class AbstractLayerSet {
 
       // If still existing (it's possible a layer set might want to unregister a layer config depending on its status, so we check)
       if (this.resultSet[layerConfig.layerPath]) {
-        // Propagate to the store
+        // Propagate the status to the store so that the UI gets updated
         this.onPropagateToStore(this.resultSet[layerConfig.layerPath], 'layerStatus');
       }
 
       // Emit the layer set updated changed event
       this.onLayerSetUpdatedProcess(layerConfig.layerPath);
-    } catch (error) {
+    } catch (error: unknown) {
       // Log
       logger.logError('CAUGHT in handleLayerStatusChanged', layerConfig.layerPath, error);
     }
@@ -364,7 +373,7 @@ export abstract class AbstractLayerSet {
         // Inform that the layer set has been updated
         this.onLayerSetUpdatedProcess(layerPath);
       }
-    } catch (error) {
+    } catch (error: unknown) {
       // Log
       logger.logError('CAUGHT in handleLayerStatusChanged', layerPath, error);
     }
@@ -405,6 +414,7 @@ export abstract class AbstractLayerSet {
 
   /**
    * Processes layer data to query features on it, if the layer path can be queried.
+   * @param {OLMap} map - The Map to query layer features from.
    * @param {AbstractGVLayer} geoviewLayer - The geoview layer
    * @param {QueryType} queryType - The query type
    * @param {TypeLocation} location - The location for the query
@@ -413,6 +423,7 @@ export abstract class AbstractLayerSet {
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise resolving to the query results
    */
   protected static queryLayerFeatures(
+    map: OLMap,
     geoviewLayer: AbstractGVLayer,
     queryType: QueryType,
     location: TypeLocation,
@@ -420,7 +431,7 @@ export abstract class AbstractLayerSet {
     abortController: AbortController | undefined = undefined
   ): Promise<TypeFeatureInfoEntry[]> {
     // Get Feature Info
-    return geoviewLayer.getFeatureInfo(queryType, location, queryGeometry, abortController);
+    return geoviewLayer.getFeatureInfo(map, queryType, location, queryGeometry, abortController);
   }
 
   /**
@@ -444,11 +455,12 @@ export abstract class AbstractLayerSet {
   /**
    * Checks if the layer is in visible range.
    * @param {AbstractGVLayer} layer - The layer
+   * @param {number | undefined} currentZoom - The map current zoom level
    * @returns {boolean} True if the state is queryable or undefined
    */
-  protected static isInVisibleRange(layer: AbstractGVLayer): boolean {
+  protected static isInVisibleRange(layer: AbstractGVLayer, currentZoom: number | undefined): boolean {
     // Return false when false or undefined
-    return layer.getInVisibleRange() ?? false;
+    return layer.getInVisibleRange(currentZoom);
   }
 
   /**

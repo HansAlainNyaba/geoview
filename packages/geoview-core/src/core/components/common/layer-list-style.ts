@@ -32,7 +32,7 @@ export const getSxClasses = (theme: Theme): SxStyles => ({
       minWidth: '2rem',
     },
     '& .MuiListItemText-root': {
-      '>span': {
+      '> span': {
         fontSize: theme.palette.geoViewFontSize.default,
       },
       '> p': {
@@ -59,6 +59,7 @@ export const getSxClasses = (theme: Theme): SxStyles => ({
       textOverflow: 'ellipsis',
       whiteSpace: 'nowrap',
       paddingRight: '10px',
+      display: 'block',
     },
     '>div': {
       display: 'flex',
@@ -103,5 +104,19 @@ export const getSxClasses = (theme: Theme): SxStyles => ({
         fontStyle: 'italic',
       },
     },
+  },
+  progressBar: {
+    width: '100%',
+    position: 'absolute',
+    bottom: 0,
+    '> span': { height: '2px' },
+  },
+  progressBarSingleLayer: {
+    position: 'absolute !important',
+    display: 'block !important',
+    bottom: '0',
+    width: '100%',
+    height: 'auto !important',
+    '> span': { height: '2px' },
   },
 });

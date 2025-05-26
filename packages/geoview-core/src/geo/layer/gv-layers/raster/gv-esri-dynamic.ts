@@ -2,15 +2,17 @@ import { ImageArcGISRest } from 'ol/source';
 import { Image as ImageLayer } from 'ol/layer';
 import { Options as ImageOptions } from 'ol/layer/BaseImage';
 import { Coordinate } from 'ol/coordinate';
-import { Pixel } from 'ol/pixel';
 import { EsriJSON } from 'ol/format';
 import { Extent } from 'ol/extent';
 import Feature from 'ol/Feature';
 import Geometry from 'ol/geom/Geometry';
+import { Projection as OLProjection } from 'ol/proj';
+import { Map as OLMap } from 'ol';
 
 import { getMetersPerPixel, validateExtent } from '@/geo/utils/utilities';
 import { Projection } from '@/geo/utils/projection';
 import { logger } from '@/core/utils/logger';
+import { Fetch } from '@/core/utils/fetch-helper';
 import { EsriDynamicLayerEntryConfig } from '@/core/utils/config/validation-classes/raster-validation-classes/esri-dynamic-layer-entry-config';
 import {
   TypeLayerStyleSettings,
@@ -24,20 +26,21 @@ import {
   TypeStyleGeometry,
   TypeValidMapProjectionCodes,
   TypeIconSymbolVectorConfig,
+  CONST_LAYER_TYPES,
 } from '@/api/config/types/map-schema-types';
 import { esriGetFieldType, esriGetFieldDomain, parseDateTimeValuesEsriDynamic } from '@/geo/layer/gv-layers/utils';
 import { AbstractGVRaster } from '@/geo/layer/gv-layers/raster/abstract-gv-raster';
 import { getLegendStyles } from '@/geo/utils/renderer/geoview-renderer';
-import { CONST_LAYER_TYPES } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
 import { TypeLegend } from '@/core/stores/store-interface-and-intial-values/layer-state';
 import { TypeEsriImageLayerLegend } from '@/geo/layer/gv-layers/raster/gv-esri-image';
 import { TypeJsonObject } from '@/api/config/types/config-types';
 import { FetchEsriWorkerPool } from '@/core/workers/fetch-esri-worker-pool';
 import { QueryParams } from '@/core/workers/fetch-esri-worker-script';
 import { GeometryApi } from '@/geo/layer/geometry/geometry';
-import { fetchWithTimeout } from '@/core/utils/fetch-helper';
-import { AbortError } from '@/core/exceptions/core-exceptions';
-import { GeoViewError } from '@/core/exceptions/geoview-exceptions';
+import { NoExtentError, NoFeaturesPropertyError } from '@/core/exceptions/geoview-exceptions';
+import { formatError, RequestAbortedError } from '@/core/exceptions/core-exceptions';
+import { LayerDataAccessPathMandatoryError, LayerInvalidLayerFilterError } from '@/core/exceptions/layer-exceptions';
+import { TypeDateFragments } from '@/core/utils/date-mgt';
 
 type TypeFieldOfTheSameValue = { value: string | number | Date; nbOccurence: number };
 type TypeQueryTree = { fieldValue: string | number | Date; nextField: TypeQueryTree }[];
@@ -54,17 +57,16 @@ export class GVEsriDynamic extends AbstractGVRaster {
   // The default hit tolerance the query should be using
   static override DEFAULT_HIT_TOLERANCE: number = 7;
 
-  // Override the hit tolerance for a GVEsriDynamic layer
-  override hitTolerance: number = GVEsriDynamic.DEFAULT_HIT_TOLERANCE;
+  // The default filter when all should be included
+  static DEFAULT_FILTER_1EQUALS1: string = '(1=1)';
 
   /**
    * Constructs a GVEsriDynamic layer to manage an OpenLayer layer.
-   * @param {string} mapId - The map id
    * @param {ImageArcGISRest} olSource - The OpenLayer source.
    * @param {EsriDynamicLayerEntryConfig} layerConfig - The layer configuration.
    */
-  public constructor(mapId: string, olSource: ImageArcGISRest, layerConfig: EsriDynamicLayerEntryConfig) {
-    super(mapId, olSource, layerConfig);
+  public constructor(olSource: ImageArcGISRest, layerConfig: EsriDynamicLayerEntryConfig) {
+    super(olSource, layerConfig);
 
     // TODO: Performance - Do we need worker pool or one worker per layer is enough. If a worker is already working we should terminate it
     // TO.DOCONT: and use the abort controller to cancel the fetch and start a new one. So every esriDynamic layer has it's own worker.
@@ -88,13 +90,6 @@ export class GVEsriDynamic extends AbstractGVRaster {
       properties: { layerConfig },
     };
 
-    // Set the image spatial reference to the service source - performance is better when open layers does the conversion
-    // Older versions of ArcGIS Server are not properly converted, so this is only used for version 10.8+
-    const version = layerConfig.getLayerMetadata()?.currentVersion as number;
-    const sourceSr =
-      layerConfig.getLayerMetadata()?.sourceSpatialReference?.latestWkid || layerConfig.getLayerMetadata()?.sourceSpatialReference?.wkid;
-    if (sourceSr && version && version >= 10.8) imageLayerOptions.source?.updateParams({ imageSR: sourceSr });
-
     // Init the layer options with initial settings
     AbstractGVRaster.initOptionsWithInitialSettings(imageLayerOptions, layerConfig);
 
@@ -103,42 +98,152 @@ export class GVEsriDynamic extends AbstractGVRaster {
   }
 
   /**
-   * Handles progress messages from a worker to update layer loading status
-   * @param {MessageEvent} event - The message event from the worker containing progress data
-   * @returns {void}
+   * Overrides the fetching of the legend for an Esri Dynamic layer.
+   * @returns {Promise<TypeLegend | null>} The legend of the layer or null.
    */
-  #handleWorkerMessage(event: MessageEvent): void {
-    // Log
-    logger.logDebug('Handling worker message', event);
+  override async onFetchLegend(): Promise<TypeLegend | null> {
+    const layerConfig = this.getLayerConfig();
+    // Only raster layers need the alternate code
+    if (layerConfig.getLayerMetadata()?.type !== 'Raster Layer') return super.onFetchLegend();
 
-    // Early return if not a FetchEsriWorker message
-    const workerLog = event.data;
-    if (workerLog.type !== 'message' || workerLog.message[0] !== 'FetchEsriWorker') {
-      return;
-    }
+    try {
+      if (!layerConfig) return null;
+      const legendUrl = `${layerConfig.geoviewLayerConfig.metadataAccessPath}/legend?f=json`;
+      const legendJson = await Fetch.fetchJsonAs<TypeEsriImageLayerLegend>(legendUrl);
 
-    // Handle based on log level
-    switch (workerLog.level) {
-      case 'info': {
-        const { processed, total } = workerLog.message[1];
-        let messageKey: string;
-        if (processed === 0) {
-          messageKey = 'layers.fetchStart';
-        } else if (processed === total) {
-          messageKey = 'layers.fetchDone';
-        } else {
-          messageKey = 'layers.fetchProgress';
-        }
-
-        this.emitMessage(messageKey, [processed, total], 'info');
-        break;
+      let legendInfo;
+      if (legendJson.layers && legendJson.layers.length === 1) {
+        legendInfo = legendJson.layers[0].legend;
+      } else if (legendJson.layers.length) {
+        const layerInfo = legendJson.layers.find((layer) => layer.layerId.toString() === layerConfig.layerId);
+        if (layerInfo) legendInfo = layerInfo.legend;
       }
-      case 'error':
-        this.emitMessage('error.layer.notAbleToQuery', [this.getLayerName()!], 'error');
-        break;
-      default:
-        break;
+
+      if (!legendInfo) {
+        const legend: TypeLegend = {
+          type: CONST_LAYER_TYPES.ESRI_IMAGE,
+          styleConfig: this.getStyle(),
+          legend: null,
+        };
+
+        return legend;
+      }
+
+      const uniqueValueStyleInfo: TypeLayerStyleConfigInfo[] = [];
+      legendInfo.forEach((info) => {
+        const styleInfo: TypeLayerStyleConfigInfo = {
+          label: info.label,
+          visible: layerConfig.initialSettings.states?.visible || true,
+          values: info.label.split(','),
+          settings: {
+            type: 'iconSymbol',
+            mimeType: info.contentType,
+            src: info.imageData,
+            width: info.width,
+            height: info.height,
+          } as TypeIconSymbolVectorConfig,
+        };
+        uniqueValueStyleInfo.push(styleInfo);
+      });
+
+      const styleSettings: TypeLayerStyleSettings = {
+        type: 'uniqueValue',
+        fields: ['default'],
+        hasDefault: false,
+        info: uniqueValueStyleInfo,
+      };
+
+      const styleConfig: TypeLayerStyleConfig = {
+        Point: styleSettings,
+      };
+
+      const legend: TypeLegend = {
+        type: CONST_LAYER_TYPES.ESRI_IMAGE,
+        styleConfig,
+        legend: await getLegendStyles(this.getStyle()),
+      };
+
+      return legend;
+    } catch (error: unknown) {
+      logger.logError(`Get Legend for ${layerConfig.layerPath} error`, error);
+      return null;
     }
+  }
+
+  /**
+   * Overrides when the style should be set by the fetched legend.
+   * @param legend
+   */
+  override onSetStyleAccordingToLegend(legend: TypeLegend): void {
+    // Set the style
+    this.setStyle(legend.styleConfig!);
+  }
+
+  /**
+   * Overrides the way to get the bounds for this layer type.
+   * @param {OLProjection} projection - The projection to get the bounds into.
+   * @param {number} stops - The number of stops to use to generate the extent.
+   * @returns {Extent | undefined} The layer bounding box.
+   */
+  override onGetBounds(projection: OLProjection, stops: number): Extent | undefined {
+    // Get the metadata projection
+    const metadataProjection = this.getMetadataProjection();
+
+    // Get the metadata extent
+    let metadataExtent = this.getMetadataExtent();
+
+    // If both found
+    if (metadataExtent && metadataProjection) {
+      // Transform extent to given projection
+      metadataExtent = Projection.transformExtentFromProj(metadataExtent, metadataProjection, projection, stops);
+      metadataExtent = validateExtent(metadataExtent, projection.getCode());
+    }
+
+    // Return the calculated layer bounds
+    return metadataExtent;
+  }
+
+  /**
+   * Sends a query to get ESRI Dynamic feature geometries and calculates an extent from them.
+   * @param {string[]} objectIds - The IDs of the features to calculate the extent from.
+   * @param {OLProjection} outProjection - The output projection for the extent.
+   * @param {string?} outfield - ID field to return for services that require a value in outfields.
+   * @returns {Promise<Extent>} The extent of the features, if available.
+   */
+  override async getExtentFromFeatures(objectIds: string[], outProjection: OLProjection, outfield?: string): Promise<Extent> {
+    // Get url for service from layer entry config
+    const layerEntryConfig = this.getLayerConfig();
+    let baseUrl = layerEntryConfig.source.dataAccessPath;
+
+    // If no base url
+    if (!baseUrl) throw new LayerDataAccessPathMandatoryError(layerEntryConfig.layerPath, layerEntryConfig.getLayerName());
+
+    // Construct query
+    if (!baseUrl.endsWith('/')) baseUrl += '/';
+
+    // Use the returnExtentOnly=true to get only the extent of ids
+    // TODO: We should return a real extent geometry Projection.transformAndDensifyExtent
+    const idString = objectIds.join('%2C');
+    const outfieldQuery = outfield ? `&outFields=${outfield}` : '';
+    const queryUrl = `${baseUrl}${layerEntryConfig.layerId}/query?&f=json&objectIds=${idString}${outfieldQuery}&returnExtentOnly=true`;
+
+    // Fetch
+    const responseJson = await Fetch.fetchEsriJsonAsObject(queryUrl);
+    const { extent } = responseJson;
+
+    const projectionExtent: OLProjection | undefined = Projection.getProjectionFromObj(extent.spatialReference);
+
+    if (extent && projectionExtent) {
+      const projExtent = Projection.transformExtentFromProj(
+        [extent.xmin as number, extent.ymin as number, extent.xmax as number, extent.ymax as number],
+        projectionExtent,
+        outProjection
+      );
+      return validateExtent(projExtent, outProjection.getCode());
+    }
+
+    // Throw
+    throw new NoExtentError(this.getLayerPath());
   }
 
   /**
@@ -166,6 +271,15 @@ export class GVEsriDynamic extends AbstractGVRaster {
   override getLayerConfig(): EsriDynamicLayerEntryConfig {
     // Call parent and cast
     return super.getLayerConfig() as EsriDynamicLayerEntryConfig;
+  }
+
+  /**
+   * Overrides the hit tolerance of the layer
+   * @returns {number} The hit tolerance for a GV Esri Dynamic layer
+   */
+  override getHitTolerance(): number {
+    // Override the hit tolerance for a GVEsriDynamic layer
+    return GVEsriDynamic.DEFAULT_HIT_TOLERANCE;
   }
 
   /**
@@ -198,13 +312,13 @@ export class GVEsriDynamic extends AbstractGVRaster {
     const layerConfig = this.getLayerConfig();
 
     // Fetch the features with worker
-    const jsonResponse = await this.fetchAllFeatureInfoWithWorker(layerConfig);
+    const jsonResponse = await this.#fetchAllFeatureInfoWithWorker(layerConfig);
 
     // If was aborted
     // Explicitely checking the abort condition here, after the fetch in the worker, because we can't send the abortController in a fetch happening inside a worker.
     if (abortController?.signal.aborted) {
       // Raise error
-      throw new AbortError('Cancelled', abortController.signal);
+      throw new RequestAbortedError(abortController.signal);
     }
 
     // If any features
@@ -224,110 +338,40 @@ export class GVEsriDynamic extends AbstractGVRaster {
     }
 
     // Error
-    throw new GeoViewError(this.getMapId(), 'Error querying service. No features were returned.');
-  }
-
-  /**
-   * Query all features with a web worker
-   * @param {EsriDynamicLayerEntryConfig} layerConfig - The layer config
-   * @returns {TypeJsonObject} A promise of esri response for query.
-   */
-  fetchAllFeatureInfoWithWorker(layerConfig: EsriDynamicLayerEntryConfig): Promise<TypeJsonObject> {
-    try {
-      const params: QueryParams = {
-        url: layerConfig.source.dataAccessPath + layerConfig.layerId,
-        geometryType: 'Point',
-        objectIds: 'all',
-        queryGeometry: false,
-        projection: 4326,
-        maxAllowableOffset: 6,
-        maxRecordCount: layerConfig.maxRecordCount || 1000,
-      };
-
-      return this.#fetchWorkerPool.process(params);
-    } catch (error) {
-      logger.logError('Query processing failed:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Overrides the return of feature information at a given pixel location.
-   * @param {Pixel} location - The pixel coordinate that will be used by the query.
-   * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
-   * @param {AbortController?} abortController - The optional abort controller.
-   * @returns {Promise<TypeFeatureInfoEntry[] | undefined | null>} A promise of an array of TypeFeatureInfoEntry[].
-   */
-  protected override getFeatureInfoAtPixel(
-    location: Pixel,
-    queryGeometry: boolean = true,
-    abortController: AbortController | undefined = undefined
-  ): Promise<TypeFeatureInfoEntry[]> {
-    // Redirect to getFeatureInfoAtCoordinate
-    return this.getFeatureInfoAtCoordinate(this.getMapViewer().map.getCoordinateFromPixel(location), queryGeometry, abortController);
+    throw new NoFeaturesPropertyError();
   }
 
   /**
    * Overrides the return of feature information at a given coordinate.
+   * @param {OLMap} map - The Map where to get Feature Info At Coordinate from.
    * @param {Coordinate} location - The coordinate that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
   protected override getFeatureInfoAtCoordinate(
+    map: OLMap,
     location: Coordinate,
     queryGeometry: boolean = true,
     abortController: AbortController | undefined = undefined
   ): Promise<TypeFeatureInfoEntry[]> {
-    // Transform coordinate from map project to lntlat
-    const projCoordinate = this.getMapViewer().convertCoordinateMapProjToLngLat(location);
+    // Transform coordinate from map projection to lntlat
+    const projCoordinate = Projection.transformToLonLat(location, map.getView().getProjection());
 
     // Redirect to getFeatureInfoAtLongLat
-    return this.getFeatureInfoAtLongLat(projCoordinate, queryGeometry, abortController);
-  }
-
-  /**
-   * Query the features geometry with a web worker
-   * @param {EsriDynamicLayerEntryConfig} layerConfig - The layer config
-   * @param {number[]} objectIds - Array of object IDs to query
-   * @param {boolean} queryGeometry - Whether to include geometry in the query
-   * @param {number} projection - The spatial reference ID for the output
-   * @param {number} maxAllowableOffset - The maximum allowable offset for geometry simplification
-   * @returns {TypeJsonObject} A promise of esri response for query.
-   */
-  async fetchFeatureInfoGeometryWithWorker(
-    layerConfig: EsriDynamicLayerEntryConfig,
-    objectIds: number[],
-    queryGeometry: boolean,
-    projection: number,
-    maxAllowableOffset: number
-  ): Promise<TypeJsonObject> {
-    try {
-      const params: QueryParams = {
-        url: layerConfig.source.dataAccessPath + layerConfig.layerId,
-        geometryType: (layerConfig.getLayerMetadata()!.geometryType as string).replace('esriGeometry', ''),
-        objectIds,
-        queryGeometry,
-        projection,
-        maxAllowableOffset,
-        maxRecordCount: layerConfig.maxRecordCount || 1000,
-      };
-
-      return await this.#fetchWorkerPool.process(params);
-    } catch (error) {
-      logger.logError('Query processing failed:', error);
-      throw error;
-    }
+    return this.getFeatureInfoAtLongLat(map, projCoordinate, queryGeometry, abortController);
   }
 
   /**
    * Overrides the return of feature information at the provided long lat coordinate.
+   * @param {OLMap} map - The Map where to get Feature Info At LongLat from.
    * @param {Coordinate} lnglat - The coordinate that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
   protected override async getFeatureInfoAtLongLat(
+    map: OLMap,
     lnglat: Coordinate,
     queryGeometry: boolean = true,
     abortController: AbortController | undefined = undefined
@@ -348,17 +392,17 @@ export class GVEsriDynamic extends AbstractGVRaster {
 
     // GV: We cannot directly use the view extent and reproject. If we do so some layers (issue #2413) identify will return empty resultset
     // GV.CONT: This happen with max extent as initial extent and 3978 projection. If we use only the LL and UP corners for the reprojection it works
-    const mapViewer = this.getMapViewer();
-    const mapExtent = mapViewer.getView().calculateExtent();
-    const boundsLL = mapViewer.convertCoordinateMapProjToLngLat([mapExtent[0], mapExtent[1]]);
-    const boundsUR = mapViewer.convertCoordinateMapProjToLngLat([mapExtent[2], mapExtent[3]]);
+    const mapExtent = map.getView().calculateExtent();
+    const boundsLL = Projection.transformToLonLat([mapExtent[0], mapExtent[1]], map.getView().getProjection());
+    const boundsUR = Projection.transformToLonLat([mapExtent[2], mapExtent[3]], map.getView().getProjection());
     const extent = { xmin: boundsLL[0], ymin: boundsLL[1], xmax: boundsUR[0], ymax: boundsUR[1] };
     const layerDefs = this.getOLSource()?.getParams()?.layerDefs || '';
-    const size = mapViewer.map.getSize()!;
+    const size = map.getSize()!;
+    const mapProjNumber = parseInt(map.getView().getProjection().getCode()?.split(':')[1] || '', 10);
 
     // Identify query to get oid features value and attributes, at this point we do not query geometry
     identifyUrl =
-      `${identifyUrl}identify?f=json&tolerance=${this.hitTolerance}` +
+      `${identifyUrl}identify?f=json&tolerance=${this.getHitTolerance()}` +
       `&mapExtent=${extent.xmin},${extent.ymin},${extent.xmax},${extent.ymax}` +
       `&imageDisplay=${size[0]},${size[1]},96` +
       `&layers=visible:${layerConfig.layerId}` +
@@ -367,22 +411,7 @@ export class GVEsriDynamic extends AbstractGVRaster {
       `&returnGeometry=false&sr=4326&returnFieldName=true`;
 
     // If it takes more then 10 seconds it means the server is unresponsive and we should not continue. This will throw an error...
-    const identifyJsonResponse = await fetchWithTimeout<TypeJsonObject>(identifyUrl, {}, 10000);
-
-    // If was aborted
-    // Explicitely checking the abort condition here, after the fetch in the worker, because we can't send the abortController in a fetch happening inside a worker.
-    if (abortController?.signal.aborted) {
-      // Raise error
-      throw new AbortError('Cancelled', abortController.signal);
-    }
-
-    if (identifyJsonResponse.error) {
-      logger.logInfo('There is a problem with this query: ', identifyUrl);
-      throw new GeoViewError(
-        this.getMapId(),
-        `Error code = ${identifyJsonResponse.error.code} ${identifyJsonResponse.error.message}` || ''
-      );
-    }
+    const identifyJsonResponse = await Fetch.fetchWithTimeout<TypeJsonObject>(identifyUrl, undefined, 10000);
 
     // If no features identified return []
     if (identifyJsonResponse.results.length === 0) return [];
@@ -391,17 +420,13 @@ export class GVEsriDynamic extends AbstractGVRaster {
     const oidField = layerConfig.source.featureInfo.outfields
       ? layerConfig.source.featureInfo.outfields.filter((field) => field.type === 'oid')[0].name
       : 'OBJECTID';
-    const objectIds = (identifyJsonResponse.results as TypeJsonObject[]).map((result: TypeJsonObject) =>
+    const objectIds = (identifyJsonResponse.results as TypeJsonObject[]).map((result) =>
       String(result.attributes[oidField]).replace(',', '')
     );
 
     // Get meters per pixel to set the maxAllowableOffset to simplify return geometry
     const maxAllowableOffset = queryGeometry
-      ? getMetersPerPixel(
-          mapViewer.getMapState().currentProjection as TypeValidMapProjectionCodes,
-          mapViewer.getView().getResolution() || 7000,
-          lnglat[1]
-        )
+      ? getMetersPerPixel(mapProjNumber as TypeValidMapProjectionCodes, map.getView().getResolution() || 7000, lnglat[1])
       : 0;
 
     // TODO: Performance - We need to separate the query attribute from geometry. We can use the attributes returned by identify to show details panel
@@ -433,27 +458,28 @@ export class GVEsriDynamic extends AbstractGVRaster {
     // Explicitely checking the abort condition here, after reading the features, because the processing above is time consuming and maybe things have become aborted meanwhile.
     if (abortController?.signal.aborted) {
       // Raise error
-      throw new AbortError('Cancelled', abortController.signal);
+      throw new RequestAbortedError(abortController.signal);
     }
 
     // If geometry is needed, use web worker to query and assign geometry later
     if (queryGeometry)
+      // TODO: REFACTOR - Here, we're launching another async task to query the geometries, but the original promise will resolve first, by design.
+      // TO.DOCONT: We should carry this extra promise with the first response so that the caller of 'getFeatureInfoAtLongLat' can know
+      // TO.DOCONT: when the geometries will be done fetching on the features that they've already received as 'resolved'. Carrying the promise
+      // TO.DOCONT: would also allow us to more gracefully handle when the fetching of the geometries has failed, because without a
+      // TO.DOCONT: handle on the promise, the caller of 'getFeatureInfoAtLongLat' have no idea of the 'fetchFeatureInfoGeometryWithWorker.catch()' here.
+      // TO.DOCONT: However, this would mean change the 'getFeatureInfoAtLongLat' function signature with regards to its return type (and affect ALL other sibling classes)
+
       // TODO: Performance - We may need to use chunk and process 50 geom at a time. When we query 500 features (points) we have CORS issue with
       // TO.DOCONT: the esri query (was working with identify). But identify was failing on huge geometry...
-      this.fetchFeatureInfoGeometryWithWorker(
-        layerConfig,
-        objectIds.map(Number),
-        true,
-        mapViewer.getMapState().currentProjection,
-        maxAllowableOffset
-      )
+      this.#fetchFeatureInfoGeometryWithWorker(layerConfig, objectIds.map(Number), true, mapProjNumber, maxAllowableOffset)
         .then((featuresJSON) => {
           (featuresJSON.features as TypeJsonObject[]).forEach((feat: TypeJsonObject, index: number) => {
             // If cancelled
             // Explicitely checking the abort condition here, after the fetch in the worker, because we can't send the abortController in a fetch happening inside a worker.
             if (abortController?.signal.aborted) {
               // Raise error
-              throw new AbortError('Cancelled', abortController.signal);
+              throw new RequestAbortedError(abortController.signal);
             }
 
             // TODO: Performance - There is still a problem when we create the feature with new EsriJSON().readFeature. It goes trought a loop and take minutes on the deflate function
@@ -488,37 +514,201 @@ export class GVEsriDynamic extends AbstractGVRaster {
             }
           });
         })
-        .catch((err) => logger.logError('Features worker', err));
+        .catch((err) => {
+          // Log
+          logger.logError('The Worker to get the feature geometries has failed', err);
+        });
 
     return arrayOfFeatureInfoEntries;
   }
 
   /**
-   * Counts the number of times the value of a field is used by the unique value style information object. Depending on the
-   * visibility of the default, we count visible or invisible settings.
-   * @param {TypeLayerStyleSettings} styleSettings - The unique value style settings to evaluate.
-   * @returns {TypeFieldOfTheSameValue[][]} The result of the evaluation. The first index of the array corresponds to the field's
-   * index in the style settings and the second one to the number of different values the field may have based on visibility of
-   * the feature.
-   * @private
+   * Applies a view filter to an Esri Dynamic layer's source by updating the `layerDefs` parameter.
+   * @param {string | undefined} filter - The raw filter string input (defaults to an empty string if not provided).
    */
-  static #countFieldOfTheSameValue(styleSettings: TypeLayerStyleSettings): TypeFieldOfTheSameValue[][] {
-    return styleSettings.info.reduce<TypeFieldOfTheSameValue[][]>(
-      (counter, styleEntry): TypeFieldOfTheSameValue[][] => {
-        if (styleEntry.visible !== false) {
-          styleEntry.values.forEach((styleValue, i) => {
-            const valueExist = counter[i]?.find((counterEntry) => counterEntry.value === styleValue);
-            if (valueExist) valueExist.nbOccurence++;
-            else if (counter[i]) counter[i].push({ value: styleValue, nbOccurence: 1 });
-            // eslint-disable-next-line no-param-reassign
-            else counter[i] = [{ value: styleValue, nbOccurence: 1 }];
-          });
+  applyViewFilter(filter: string | undefined = ''): void {
+    // Log
+    logger.logTraceCore('GV-ESRI-DYNAMIC - applyViewFilterOnSource', this.getLayerPath());
+
+    // Redirect
+    GVEsriDynamic.applyViewFilterOnSource(
+      this.getLayerConfig(),
+      this.getOLSource(),
+      this.getStyle(),
+      this.getExternalFragmentsOrder(),
+      this,
+      filter,
+      (filterToUse: string) => {
+        // Emit event
+        this.emitLayerFilterApplied({
+          filter: filterToUse,
+        });
+      }
+    );
+  }
+
+  /**
+   * Query all features with a web worker
+   * @param {EsriDynamicLayerEntryConfig} layerConfig - The layer config
+   * @returns {TypeJsonObject} A promise of esri response for query.
+   */
+  #fetchAllFeatureInfoWithWorker(layerConfig: EsriDynamicLayerEntryConfig): Promise<TypeJsonObject> {
+    const params: QueryParams = {
+      url: layerConfig.source.dataAccessPath + layerConfig.layerId,
+      geometryType: 'Point',
+      objectIds: 'all',
+      queryGeometry: false,
+      projection: 4326,
+      maxAllowableOffset: 6,
+      maxRecordCount: layerConfig.maxRecordCount || 1000,
+    };
+
+    // Launch
+    return this.#fetchWorkerPool.process(params);
+  }
+
+  /**
+   * Query the features geometry with a web worker
+   * @param {EsriDynamicLayerEntryConfig} layerConfig - The layer config
+   * @param {number[]} objectIds - Array of object IDs to query
+   * @param {boolean} queryGeometry - Whether to include geometry in the query
+   * @param {number} projection - The spatial reference ID for the output
+   * @param {number} maxAllowableOffset - The maximum allowable offset for geometry simplification
+   * @returns {TypeJsonObject} A promise of esri response for query.
+   */
+  #fetchFeatureInfoGeometryWithWorker(
+    layerConfig: EsriDynamicLayerEntryConfig,
+    objectIds: number[],
+    queryGeometry: boolean,
+    projection: number,
+    maxAllowableOffset: number
+  ): Promise<TypeJsonObject> {
+    const params: QueryParams = {
+      url: layerConfig.source.dataAccessPath + layerConfig.layerId,
+      geometryType: (layerConfig.getLayerMetadata()!.geometryType as string).replace('esriGeometry', ''),
+      objectIds,
+      queryGeometry,
+      projection,
+      maxAllowableOffset,
+      maxRecordCount: layerConfig.maxRecordCount || 1000,
+    };
+
+    // Launch
+    return this.#fetchWorkerPool.process(params);
+  }
+
+  /**
+   * Handles progress messages from a worker to update layer loading status
+   * @param {MessageEvent} event - The message event from the worker containing progress data
+   * @returns {void}
+   */
+  #handleWorkerMessage(event: MessageEvent): void {
+    // Log
+    logger.logDebug('Handling worker message', event);
+
+    // Early return if not a FetchEsriWorker message
+    const workerLog = event.data;
+    if (workerLog.type !== 'message' || workerLog.message[0] !== 'FetchEsriWorker') {
+      return;
+    }
+
+    // Handle based on log level
+    switch (workerLog.level) {
+      case 'info': {
+        const { processed, total } = workerLog.message[1];
+        let messageKey: string;
+        if (processed === 0) {
+          messageKey = 'layers.fetchStart';
+        } else if (processed === total) {
+          messageKey = 'layers.fetchDone';
+        } else {
+          messageKey = 'layers.fetchProgress';
         }
 
-        return counter;
-      },
-      styleSettings.fields.map<TypeFieldOfTheSameValue[]>(() => [])
-    );
+        this.emitMessage(messageKey, [processed, total], 'info');
+        break;
+      }
+      case 'error':
+        this.emitMessage('error.layer.notAbleToQuery', [this.getLayerName()], 'error');
+        break;
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Applies a view filter to an Esri Dynamic layer's source by updating the `layerDefs` parameter.
+   * This function is responsible for generating the appropriate filter expression based on the layer configuration,
+   * optional style, and time-based fragments. It ensures the filter is only applied if it has changed or needs to be reset.
+   * @param {EsriDynamicLayerEntryConfig} layerConfig - The configuration object for the Esri Dynamic layer.
+   * @param {ImageArcGISRest} source - The OpenLayers `ImageArcGISRest` source instance to which the filter will be applied.
+   * @param {TypeLayerStyleConfig | undefined} style - Optional style configuration that may influence filter expression generation.
+   * @param {TypeDateFragments | undefined} externalDateFragments - Optional external date fragments used to assist in formatting time-based filters.
+   * @param {GVEsriDynamic | undefined} layer - Optional GeoView layer containing the source (if exists) in order to trigger a redraw.
+   * @param {string | undefined} filter - The raw filter string input (defaults to an empty string if not provided).
+   * @param {Function?} callbackWhenUpdated - Optional callback that is invoked with the final filter string if the layer was updated.
+   * @throws {LayerInvalidLayerFilterError} If the filter expression fails to parse or cannot be applied.
+   */
+  static applyViewFilterOnSource(
+    layerConfig: EsriDynamicLayerEntryConfig,
+    source: ImageArcGISRest,
+    style: TypeLayerStyleConfig | undefined,
+    externalDateFragments: TypeDateFragments | undefined,
+    layer: GVEsriDynamic | undefined,
+    filter: string | undefined = '',
+    callbackWhenUpdated: ((filterToUse: string) => void) | undefined = undefined
+  ): void {
+    // Parse the filter value to use
+    let filterValueToUse = filter.replaceAll(/\s{2,}/g, ' ').trim();
+
+    // Get the current filter
+    const currentFilter = source.getParams().layerDefs;
+
+    try {
+      // Update the layer config information (not ideal to do this here...)
+      // eslint-disable-next-line no-param-reassign
+      layerConfig.legendFilterIsOff = false;
+      // eslint-disable-next-line no-param-reassign
+      layerConfig.layerFilter = filterValueToUse;
+      filterValueToUse = GVEsriDynamic.getViewFilter(layerConfig, style);
+
+      // Parse the filter value to use
+      filterValueToUse = parseDateTimeValuesEsriDynamic(filterValueToUse, externalDateFragments);
+
+      // Create the source parameter to update
+      const layerDefs = layerConfig.getLayerMetadata()?.type === 'Raster Layer' ? '' : `{"${layerConfig.layerId}": "${filterValueToUse}"}`;
+
+      // Define what is considered the default filter (e.g., "1=1")
+      const isDefaultFilter = filterValueToUse === GVEsriDynamic.DEFAULT_FILTER_1EQUALS1;
+
+      // Define what is a no operation
+      const isNewFilterEffectivelyNoop = isDefaultFilter && !currentFilter;
+
+      // Check whether the current filter is different from the new one
+      const filterChanged = layerDefs !== currentFilter;
+
+      // Determine if we should apply or reset filter
+      const shouldUpdateFilter = (filterChanged && !isNewFilterEffectivelyNoop) || (!!currentFilter && isDefaultFilter);
+
+      // If should update the filtering
+      if (shouldUpdateFilter) {
+        // Update the source params
+        source.updateParams({ layerDefs });
+        layer?.getOLLayer().changed();
+
+        // Callback
+        callbackWhenUpdated?.(filterValueToUse);
+      }
+    } catch (error: unknown) {
+      // Failed
+      throw new LayerInvalidLayerFilterError(
+        layerConfig.layerPath,
+        layerConfig.getLayerName(),
+        filterValueToUse,
+        currentFilter,
+        formatError(error)
+      );
+    }
   }
 
   /**
@@ -526,12 +716,8 @@ export class GVEsriDynamic extends AbstractGVRaster {
    * associated to the layer.
    * @returns {string} The filter associated to the layer
    */
-  getViewFilter(): string {
-    const layerConfig = this.getLayerConfig();
+  static getViewFilter(layerConfig: EsriDynamicLayerEntryConfig, style: TypeLayerStyleConfig | undefined): string {
     const { layerFilter } = layerConfig;
-
-    // Get the style
-    const style = this.getStyle();
 
     if (style) {
       const setAllUndefinedVisibilityFlagsToYes = (styleConfig: TypeLayerStyleSettings): void => {
@@ -548,26 +734,26 @@ export class GVEsriDynamic extends AbstractGVRaster {
       const styleSettings = layerConfig.getFirstStyleSettings()!;
 
       if (styleSettings.type === 'simple') {
-        return layerFilter || '(1=1)';
+        return layerFilter || GVEsriDynamic.DEFAULT_FILTER_1EQUALS1;
       }
       if (styleSettings.type === 'uniqueValue') {
         setAllUndefinedVisibilityFlagsToYes(styleSettings);
         if (featuresAreAllVisible(styleSettings.info as { visible: boolean }[]))
-          return `(1=1)${layerFilter ? ` and (${layerFilter})` : ''}`;
+          return `${GVEsriDynamic.DEFAULT_FILTER_1EQUALS1}${layerFilter ? ` and (${layerFilter})` : ''}`;
 
         // This section of code optimize the query to reduce it at it shortest expression.
         const fieldOfTheSameValue = GVEsriDynamic.#countFieldOfTheSameValue(styleSettings);
         const fieldOrder = GVEsriDynamic.#sortFieldOfTheSameValue(styleSettings, fieldOfTheSameValue);
         const queryTree = GVEsriDynamic.#getQueryTree(styleSettings, fieldOfTheSameValue, fieldOrder);
         // TODO: Refactor - Layers refactoring. Use the source.featureInfo from the layer, not the layerConfig anymore, here and below
-        const query = this.#buildQuery(queryTree, 0, fieldOrder, styleSettings, layerConfig.source.featureInfo!);
+        const query = GVEsriDynamic.#buildQuery(queryTree, 0, fieldOrder, styleSettings, layerConfig.source.featureInfo!);
         return `${query}${layerFilter ? ` and (${layerFilter})` : ''}`;
       }
 
       if (styleSettings.type === 'classBreaks') {
         setAllUndefinedVisibilityFlagsToYes(styleSettings);
         if (featuresAreAllVisible(styleSettings.info as { visible: boolean }[]))
-          return `(1=1)${layerFilter ? ` and (${layerFilter})` : ''}`;
+          return `${GVEsriDynamic.DEFAULT_FILTER_1EQUALS1}${layerFilter ? ` and (${layerFilter})` : ''}`;
 
         const filterArray: string[] = [];
         let visibleWhenGreatherThisIndex = -1;
@@ -705,7 +891,35 @@ export class GVEsriDynamic extends AbstractGVRaster {
         return `${filterValue}${layerFilter ? ` and (${layerFilter})` : ''}`;
       }
     }
-    return '(1=1)';
+    return GVEsriDynamic.DEFAULT_FILTER_1EQUALS1;
+  }
+
+  /**
+   * Counts the number of times the value of a field is used by the unique value style information object. Depending on the
+   * visibility of the default, we count visible or invisible settings.
+   * @param {TypeLayerStyleSettings} styleSettings - The unique value style settings to evaluate.
+   * @returns {TypeFieldOfTheSameValue[][]} The result of the evaluation. The first index of the array corresponds to the field's
+   * index in the style settings and the second one to the number of different values the field may have based on visibility of
+   * the feature.
+   * @private
+   */
+  static #countFieldOfTheSameValue(styleSettings: TypeLayerStyleSettings): TypeFieldOfTheSameValue[][] {
+    return styleSettings.info.reduce<TypeFieldOfTheSameValue[][]>(
+      (counter, styleEntry): TypeFieldOfTheSameValue[][] => {
+        if (styleEntry.visible !== false) {
+          styleEntry.values.forEach((styleValue, i) => {
+            const valueExist = counter[i]?.find((counterEntry) => counterEntry.value === styleValue);
+            if (valueExist) valueExist.nbOccurence++;
+            else if (counter[i]) counter[i].push({ value: styleValue, nbOccurence: 1 });
+            // eslint-disable-next-line no-param-reassign
+            else counter[i] = [{ value: styleValue, nbOccurence: 1 }];
+          });
+        }
+
+        return counter;
+      },
+      styleSettings.fields.map<TypeFieldOfTheSameValue[]>(() => [])
+    );
   }
 
   /**
@@ -798,7 +1012,7 @@ export class GVEsriDynamic extends AbstractGVRaster {
    * @returns {string} The resulting query.
    * @private
    */
-  #buildQuery(
+  static #buildQuery(
     queryTree: TypeQueryTree,
     level: number,
     fieldOrder: number[],
@@ -813,7 +1027,7 @@ export class GVEsriDynamic extends AbstractGVRaster {
         // If i > 0 (true) then we add a OR clause
         if (i) queryString = `${queryString} or `;
         // Add to the query the 'fieldName = value and ' + the result of the recursive call to buildQuery using the next field and level
-        queryString = `${queryString}${styleSettings.fields[fieldOrder[level]]} = ${value} and ${this.#buildQuery(
+        queryString = `${queryString}${styleSettings.fields[fieldOrder[level]]} = ${value} and ${GVEsriDynamic.#buildQuery(
           queryTree[i].nextField,
           level + 1,
           fieldOrder,
@@ -850,241 +1064,5 @@ export class GVEsriDynamic extends AbstractGVRaster {
       default:
         return `${rawValue}`;
     }
-  }
-
-  /**
-   * Overrides the fetching of the legend for an Esri Dynamic layer.
-   * @returns {Promise<TypeLegend | null>} The legend of the layer or null.
-   */
-  override async onFetchLegend(): Promise<TypeLegend | null> {
-    const layerConfig = this.getLayerConfig();
-    // Only raster layers need the alternate code
-    if (layerConfig.getLayerMetadata()?.type !== 'Raster Layer') return super.onFetchLegend();
-
-    try {
-      if (!layerConfig) return null;
-      const legendUrl = `${layerConfig.geoviewLayerConfig.metadataAccessPath}/legend?f=json`;
-      const response = await fetch(legendUrl);
-      const legendJson: TypeEsriImageLayerLegend = await response.json();
-
-      let legendInfo;
-      if (legendJson.layers && legendJson.layers.length === 1) {
-        legendInfo = legendJson.layers[0].legend;
-      } else if (legendJson.layers.length) {
-        const layerInfo = legendJson.layers.find((layer) => layer.layerId.toString() === layerConfig.layerId);
-        if (layerInfo) legendInfo = layerInfo.legend;
-      }
-
-      if (!legendInfo) {
-        const legend: TypeLegend = {
-          type: CONST_LAYER_TYPES.ESRI_IMAGE,
-          styleConfig: this.getStyle(),
-          legend: null,
-        };
-
-        return legend;
-      }
-
-      const uniqueValueStyleInfo: TypeLayerStyleConfigInfo[] = [];
-      legendInfo.forEach((info) => {
-        const styleInfo: TypeLayerStyleConfigInfo = {
-          label: info.label,
-          visible: layerConfig.initialSettings.states?.visible || true,
-          values: info.label.split(','),
-          settings: {
-            type: 'iconSymbol',
-            mimeType: info.contentType,
-            src: info.imageData,
-            width: info.width,
-            height: info.height,
-          } as TypeIconSymbolVectorConfig,
-        };
-        uniqueValueStyleInfo.push(styleInfo);
-      });
-
-      const styleSettings: TypeLayerStyleSettings = {
-        type: 'uniqueValue',
-        fields: ['default'],
-        hasDefault: false,
-        info: uniqueValueStyleInfo,
-      };
-
-      const styleConfig: TypeLayerStyleConfig = {
-        Point: styleSettings,
-      };
-
-      const legend: TypeLegend = {
-        type: CONST_LAYER_TYPES.ESRI_IMAGE,
-        styleConfig,
-        legend: await getLegendStyles(this.getStyle()),
-      };
-
-      return legend;
-    } catch (error) {
-      logger.logError(`Get Legend for ${layerConfig.layerPath} error`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Overrides when the style should be set by the fetched legend.
-   * @param legend
-   */
-  override onSetStyleAccordingToLegend(legend: TypeLegend): void {
-    // Set the style
-    this.setStyle(legend.styleConfig!);
-  }
-
-  /**
-   * Overrides when the layer gets in loaded status.
-   */
-  override onLoaded(): void {
-    // Call parent
-    super.onLoaded();
-
-    // Apply view filter immediately
-    this.applyViewFilter(this.getLayerConfig().layerFilter || '');
-  }
-
-  /**
-   * Applies a view filter to the layer. When the combineLegendFilter flag is false, the filter paramater is used alone to display
-   * the features. Otherwise, the legend filter and the filter parameter are combined together to define the view filter. The
-   * legend filters are derived from the uniqueValue or classBreaks style of the layer. When the layer config is invalid, nothing
-   * is done.
-   * @param {string} filter - An optional filter to be used in place of the getViewFilter value.
-   * @param {boolean} combineLegendFilter - Flag used to combine the legend filter and the filter together (default: true)
-   */
-  applyViewFilter(filter: string, combineLegendFilter: boolean = true): void {
-    // Log
-    logger.logTraceCore('GV-ESRI-DYNAMIC - applyViewFilter', this.getLayerPath());
-
-    const layerConfig = this.getLayerConfig();
-    const olLayer = this.getOLLayer();
-
-    // TODO: Check - applyViewFilter implementation? Read the GV notes here
-    // GV This code section differs from example GVEsriImage and GVWMS with the way the source is checked in the other classes implementation
-    // GV Also, in this implementation, the layerConfig.layerFilter is updated with the timmed filter, not in the other classes implementations
-    // GV ..which furthermore is actually only set in the `if (combineLegendFilter)` clause in the other classes implementations
-    let filterValueToUse = filter.replaceAll(/\s{2,}/g, ' ').trim();
-    layerConfig.legendFilterIsOff = !combineLegendFilter;
-    layerConfig.layerFilter = filterValueToUse;
-    if (combineLegendFilter) filterValueToUse = this.getViewFilter();
-
-    // Parse the filter value to use
-    filterValueToUse = parseDateTimeValuesEsriDynamic(filterValueToUse, this.getExternalFragmentsOrder());
-
-    // Raster layer queries do not accept any layerDefs
-    const layerDefs = layerConfig.getLayerMetadata()?.type === 'Raster Layer' ? '' : `{"${layerConfig.layerId}": "${filterValueToUse}"}`;
-    olLayer?.getSource()?.updateParams({ layerDefs });
-    olLayer?.changed();
-
-    // Emit event
-    this.emitLayerFilterApplied({
-      filter: filterValueToUse,
-    });
-  }
-
-  /**
-   * Overrides the way to get the bounds for this layer type.
-   * @returns {Extent | undefined} The layer bounding box.
-   */
-  override onGetBounds(): Extent | undefined {
-    // Get the metadata extent
-    const metadataExtent = this.getMetadataExtent();
-
-    // If found
-    let layerBounds;
-    if (metadataExtent) {
-      // Get the metadata projection
-      const metadataProjection = this.getMetadataProjection()?.getCode();
-      layerBounds = this.getMapViewer().convertExtentFromProjToMapProj(metadataExtent, metadataProjection);
-      layerBounds = validateExtent(layerBounds, this.getMapViewer().getProjection().getCode());
-    }
-
-    // Return the calculated layer bounds
-    return layerBounds;
-  }
-
-  /**
-   * Sends a query to get ESRI Dynamic feature geometries and calculates an extent from them.
-   * @param {string[]} objectIds - The IDs of the features to calculate the extent from.
-   * @param {string} outfield - ID field to return for services that require a value in outfields.
-   * @returns {Promise<Extent | undefined>} The extent of the features, if available.
-   */
-  override async getExtentFromFeatures(objectIds: string[], outfield?: string): Promise<Extent | undefined> {
-    // Get url for service from layer entry config
-    const layerEntryConfig = this.getLayerConfig();
-    let baseUrl = layerEntryConfig.source.dataAccessPath;
-
-    const idString = objectIds.join('%2C');
-    if (baseUrl) {
-      // Construct query
-      if (!baseUrl.endsWith('/')) baseUrl += '/';
-
-      // Use the returnExtentOnly=true to get only the extent of ids
-      // TODO: We should return a real extent geometry Projection.transformAndDensifyExtent
-      const outfieldQuery = outfield ? `&outFields=${outfield}` : '';
-      const queryUrl = `${baseUrl}${layerEntryConfig.layerId}/query?&f=json&objectIds=${idString}${outfieldQuery}&returnExtentOnly=true`;
-
-      try {
-        const response = await fetch(queryUrl);
-        const responseJson = await response.json();
-        const { extent } = responseJson;
-
-        if (extent) {
-          const projExtent = Projection.transformExtentFromProj(
-            [extent.xmin, extent.ymin, extent.xmax, extent.ymax],
-            `EPSG:${extent.spatialReference.latestWkid || extent.spatialReference.wkid}`,
-            this.getMapViewer().getProjection().getCode()
-          );
-          return validateExtent(projExtent, this.getMapViewer().getProjection().getCode());
-        }
-      } catch (error) {
-        logger.logError(`Error fetching geometry from ${queryUrl}`, error);
-      }
-
-      // TODO: Cleanup - Keep for reference
-      // // GV: outFields here is not wanted, it is included because some sevices require it in the query. It would be possible to use
-      // // GV cont: OBJECTID, but it is not universal through the services, so we pass a value through.
-      // const outfieldQuery = outfield ? `&outFields=${outfield}` : '';
-      // let precision = '';
-      // let allowableOffset = '';
-      // if ((serviceMetaData?.layers as Array<TypeJsonObject>).every((layer) => layer.geometryType !== 'esriGeometryPoint')) {
-      //   precision = '&geometryPrecision=1';
-      //   allowableOffset = '&maxAllowableOffset=7937.5158750317505';
-      // }
-      // const queryUrl = `${baseUrl}${layerEntryConfig.layerId}/query?&f=json&where=&objectIds=${idString}${outfieldQuery}${precision}&returnGeometry=true${allowableOffset}`;
-
-      // try {
-      //   const response = await fetch(queryUrl);
-      //   const responseJson = await response.json();
-
-      //   // Convert response json to OL features
-      //   const responseFeatures = new EsriJSON().readFeatures(
-      //     { features: responseJson.features },
-      //     {
-      //       dataProjection: wkid ? `EPSG:${wkid}` : `EPSG:${responseJson.spatialReference.wkid}`,
-      //       featureProjection: this.getMapViewer().getProjection().getCode(),
-      //     }
-      //   );
-
-      //   // Determine max extent from features
-      //   let calculatedExtent: Extent | undefined;
-      //   responseFeatures.forEach((feature) => {
-      //     const extent = feature.getGeometry()?.getExtent();
-
-      //     if (extent) {
-      //       // If extent has not been defined, set it to extent
-      //       if (!calculatedExtent) calculatedExtent = extent;
-      //       else getExtentUnion(calculatedExtent, extent);
-      //     }
-      //   });
-
-      //   return calculatedExtent;
-      // } catch (error) {
-      //   logger.logError(`Error fetching geometry from ${queryUrl}`, error);
-      // }
-    }
-    return undefined;
   }
 }

@@ -66,7 +66,7 @@ export const getSxClasses = (theme: Theme): SxClasses => ({
       marginRight: '20px',
     },
     '& .MuiListItemText-root': {
-      '>span': {
+      '> span': {
         fontSize: theme.palette.geoViewFontSize.default,
       },
       '> p': {
@@ -74,6 +74,8 @@ export const getSxClasses = (theme: Theme): SxClasses => ({
         overflow: 'hidden',
         textOverflow: 'ellipsis',
         whiteSpace: 'nowrap',
+        color: `${theme.palette.geoViewColor.textColor.main} !important`,
+        fontWeight: '400 !important',
       },
     },
   },

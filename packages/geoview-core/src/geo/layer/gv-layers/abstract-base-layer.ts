@@ -1,17 +1,15 @@
 import BaseLayer from 'ol/layer/Base';
+import { Projection as OLProjection } from 'ol/proj';
 
 import { Extent, TypeLayerStatus } from '@/api/config/types/map-schema-types';
 import EventHelper, { EventDelegateBase } from '@/api/events/event-helper';
 import { ConfigBaseClass } from '@/core/utils/config/validation-classes/config-base-class';
-import { logger } from '@/core/utils/logger';
+import { NotImplementedError } from '@/core/exceptions/core-exceptions';
 
 /**
  * Abstract Base Layer managing an OpenLayer layer, including a layer group.
  */
 export abstract class AbstractBaseLayer {
-  // The map id
-  #mapId: string;
-
   // The layer configuration
   #layerConfig: ConfigBaseClass;
 
@@ -32,11 +30,9 @@ export abstract class AbstractBaseLayer {
 
   /**
    * Constructs a GeoView base layer to manage an OpenLayer layer, including group layers.
-   * @param {string} mapId - The map id
    * @param {ConfigBaseClass} layerConfig - The layer configuration.
    */
-  protected constructor(mapId: string, layerConfig: ConfigBaseClass) {
-    this.#mapId = mapId;
+  protected constructor(layerConfig: ConfigBaseClass) {
     this.#layerConfig = layerConfig;
     this.#layerName = layerConfig.layerName;
   }
@@ -53,14 +49,6 @@ export abstract class AbstractBaseLayer {
   public getClassName(): string {
     // Return the name of the class
     return this.constructor.name;
-  }
-
-  /**
-   * Gets the Map Id
-   * @returns The Map id
-   */
-  getMapId(): string {
-    return this.#mapId;
   }
 
   /**
@@ -107,19 +95,17 @@ export abstract class AbstractBaseLayer {
    * Gets the layer status
    * @returns The layer status
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   getLayerStatus(): TypeLayerStatus {
     // Take the layer status from the config
     return this.getLayerConfig()!.layerStatus;
   }
 
   /**
-   * Gets the layer name
+   * Gets the layer name or fallsback on the layer name in the layer configuration.
    * @returns The layer name
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  getLayerName(): string | undefined {
-    return this.#layerName;
+  getLayerName(): string {
+    return this.#layerName || this.getLayerConfig().getLayerName();
   }
 
   /**
@@ -153,14 +139,13 @@ export abstract class AbstractBaseLayer {
   /**
    * Overridable function that gets the extent of an array of features.
    * @param {string[]} objectIds - The IDs of the features to calculate the extent from.
+   * @param {OLProjection} outProjection - The output projection for the extent.
    * @param {string} outfield - ID field to return for services that require a value in outfields.
-   * @returns {Promise<Extent | undefined>} The extent of the features, if available
+   * @returns {Promise<Extent>} The extent of the features, if available
    */
-  // Added eslint-disable here, because we do want to override this method in children and keep 'this'.
-  // eslint-disable-next-line @typescript-eslint/class-methods-use-this
-  getExtentFromFeatures(objectIds: string[], outfield?: string): Promise<Extent | undefined> {
-    logger.logError(`Feature geometry for ${objectIds}-${outfield} is unavailable from ${this.getLayerPath()}`);
-    return Promise.resolve(undefined);
+  getExtentFromFeatures(objectIds: string[], outProjection: OLProjection, outfield?: string): Promise<Extent> {
+    // Not implemented
+    throw new NotImplementedError(`Feature geometry for ${objectIds}-${outfield} is unavailable from ${this.getLayerPath()}`);
   }
 
   /**
@@ -337,7 +322,7 @@ export type LayerNameChangedEvent = {
 /**
  * Define a delegate for the event handler function signature.
  */
-type LayerNameChangedDelegate = EventDelegateBase<AbstractBaseLayer, LayerNameChangedEvent, void>;
+export type LayerNameChangedDelegate = EventDelegateBase<AbstractBaseLayer, LayerNameChangedEvent, void>;
 
 /**
  * Define an event for the delegate

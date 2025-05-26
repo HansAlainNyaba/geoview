@@ -17,12 +17,6 @@ export class CsvLayerEntryConfig extends VectorLayerEntryConfig {
     super(layerConfig);
     Object.assign(this, layerConfig);
 
-    if (!this.geoviewLayerConfig.metadataAccessPath && !this.source?.dataAccessPath) {
-      throw new Error(
-        `dataAccessPath is mandatory for GeoView layer ${this.geoviewLayerConfig.geoviewLayerId} when the metadataAccessPath is undefined.`
-      );
-    }
-
     // Default value for this.entryType is vector
     if (this.entryType === undefined) this.entryType = CONST_LAYER_ENTRY_TYPES.VECTOR;
 
@@ -32,11 +26,7 @@ export class CsvLayerEntryConfig extends VectorLayerEntryConfig {
     if (!this.source.separator) this.source.separator = ',';
 
     // If undefined, we assign the metadataAccessPath of the CSV layer to dataAccessPath and place the layerId at the end of it, if needed.
-    if (!this.source.dataAccessPath) {
-      let accessPath = this.geoviewLayerConfig.metadataAccessPath!;
-      accessPath = accessPath!.split('/').length > 1 ? accessPath!.split('/').slice(0, -1).join('/') : './';
-      this.source.dataAccessPath = accessPath;
-    }
+    if (!this.source.dataAccessPath) this.source.dataAccessPath = this.geoviewLayerConfig.metadataAccessPath;
 
     if (
       !(this.source.dataAccessPath!.startsWith('blob') && !this.source.dataAccessPath!.endsWith('/')) &&

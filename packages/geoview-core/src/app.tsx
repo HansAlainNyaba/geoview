@@ -18,14 +18,16 @@ import * as UI from '@/ui';
 
 import AppStart from '@/core/app-start';
 import { API } from '@/api/api';
-import { TypeCGPV, TypeMapFeaturesConfig } from '@/core/types/global-types';
+import { MapViewerDelegate, TypeCGPV, TypeMapFeaturesConfig } from '@/core/types/global-types';
 import { Config } from '@/core/utils/config/config';
 import { useWhatChanged } from '@/core/utils/useWhatChanged';
 import { addGeoViewStore } from '@/core/stores/stores-managers';
-import i18n from '@/core/translation/i18n';
 import { logger } from '@/core/utils/logger';
-import { removeCommentsFromJSON, whenThisThen } from '@/core/utils/utilities';
-import { GeoViewError } from '@/core/exceptions/geoview-exceptions';
+import { getLocalizedMessage, removeCommentsFromJSON } from '@/core/utils/utilities';
+import { InitMapWrongCallError } from '@/core/exceptions/geoview-exceptions';
+import { Fetch } from '@/core/utils/fetch-helper';
+import { TypeJsonObject } from '@/api/config/types/config-types';
+import { MapViewer } from '@/geo/map/map-viewer';
 
 // The next export allow to import the exernal-types from 'geoview-core' from outside of the geoview-core package.
 export * from './core/types/external-types';
@@ -34,10 +36,10 @@ export const api = new API();
 
 const reactRoot: Record<string, Root> = {};
 
-let cgpvCallbackMapInit: (mapId: string) => void | undefined;
-let cgpvCallbackMapReady: (mapId: string) => void | undefined;
-let cgpvCallbackLayersProcessed: (mapId: string) => void | undefined;
-let cgpvCallbackLayersLoaded: (mapId: string) => void | undefined;
+let cgpvCallbackMapInit: MapViewerDelegate;
+let cgpvCallbackMapReady: MapViewerDelegate;
+let cgpvCallbackLayersProcessed: MapViewerDelegate;
+let cgpvCallbackLayersLoaded: MapViewerDelegate;
 
 /**
  * Checks if a root is mounted for a given map ID
@@ -59,7 +61,7 @@ export function unmountMap(mapId: string, mapContainer: HTMLElement): void {
     try {
       reactRoot[mapId].unmount();
       logger.logInfo(`Map ${mapId} is unmounted...`);
-    } catch (error) {
+    } catch (error: unknown) {
       logger.logError(`Error unmounting map ${mapId}:`, error);
     } finally {
       // Remove React-specific attributes
@@ -69,19 +71,6 @@ export function unmountMap(mapId: string, mapContainer: HTMLElement): void {
       delete reactRoot[mapId];
     }
   }
-}
-
-/**
- * Function to read the configuration specified
- *
- * @param {string} configUrl - url to fetch the config from
- * @returns configuration string
- */
-async function fetchConfigFile(configUrl: string): Promise<string> {
-  const response = await fetch(configUrl);
-  const result = await response.json();
-
-  return result;
 }
 
 /**
@@ -99,7 +88,7 @@ async function getMapConfig(mapElement: Element): Promise<TypeMapFeaturesConfig>
   const lang = mapElement.hasAttribute('data-lang') ? (mapElement.getAttribute('data-lang')! as TypeDisplayLanguage) : 'en';
 
   // create a new config object and apply default
-  let mapConfig: MapFeatureConfig = api.config.getDefaultMapFeatureConfig(lang);
+  let mapConfig: MapFeatureConfig = api.config.getDefaultMapFeatureConfig();
 
   // check what type of config is provided (data-config, data-config-url or data-shared)
   if (mapElement.hasAttribute('data-config')) {
@@ -120,7 +109,7 @@ async function getMapConfig(mapElement: Element): Promise<TypeMapFeaturesConfig>
   } else if (mapElement.hasAttribute('data-config-url')) {
     // configurations file url is provided, fetch then process
     const configUrl = mapElement.getAttribute('data-config-url');
-    const configObject = await fetchConfigFile(configUrl!);
+    const configObject = await Fetch.fetchJsonAs<string | TypeJsonObject>(configUrl!);
     mapConfig = await api.config.createMapConfig(configObject, lang);
 
     // TODO: refactor - remove this injection once config is done, remove the casting to unknown
@@ -163,61 +152,54 @@ async function getMapConfig(mapElement: Element): Promise<TypeMapFeaturesConfig>
  *
  * @param {Element} mapElement - The html element div who will contain the map
  */
-async function renderMap(mapElement: Element): Promise<void> {
+async function renderMap(mapElement: Element): Promise<MapViewer> {
   // if a config is provided from either inline div, url params or json file, validate it with against the schema
   // otherwise return the default config
   const configuration = await getMapConfig(mapElement);
+
+  // Read the map id
+  const { mapId } = configuration;
 
   // TODO: refactor - remove this config once we get layers from the new one
   // create a new config for this map element
   const lang = mapElement.hasAttribute('data-lang') ? (mapElement.getAttribute('data-lang')! as TypeDisplayLanguage) : 'en';
 
-  // Set the i18n language to the language specified in the config
-  await i18n.changeLanguage(lang);
-
   const config = new Config(lang);
   const configObj = config.initializeMapConfig(
-    configuration.mapId,
+    mapId,
     configuration!.map!.listOfGeoviewLayerConfig! as MapConfigLayerEntry[], // TODO: refactor - remove cast after
     (errorKey: string, params: string[]) => {
       // Wait for the map viewer to get loaded in the api
-      whenThisThen(() => api.getMapViewer(configuration.mapId))
+      api
+        .getMapViewerAsync(mapId)
         .then(() => {
-          // Create the error
-          const error = new GeoViewError(configuration.mapId, errorKey, params);
+          // Get the message for the logger
+          const message = getLocalizedMessage(lang, errorKey, params);
 
           // Log it
-          logger.logWarning(`- Map ${configuration.mapId}: ${error.message}`);
+          logger.logError(`- Map ${mapId}: ${message}`);
 
-          // Show the error
-          api.getMapViewer(configuration.mapId).notifications.showError(error.message);
+          // Show the error using its key (which will get translated)
+          api.getMapViewer(mapId).notifications.showError(errorKey, params);
         })
-        .catch((error) => {
+        .catch((error: unknown) => {
           // Log promise failed
-          logger.logPromiseFailed('Promise failed in whenThisThen in initializeMapConfig in app.renderMap', error);
+          logger.logPromiseFailed('Promise failed in getMapViewerAsync in config.initializeMapConfig in app.renderMap', error);
         });
     }
   );
   configuration.map.listOfGeoviewLayerConfig = configObj!;
 
-  // if valid config was provided - mapId is now part of config
-  if (configuration) {
-    const { mapId } = configuration;
+  // render the map with the config
+  reactRoot[mapId] = createRoot(mapElement!);
 
-    // render the map with the config
-    reactRoot[mapId] = createRoot(mapElement!);
+  // add config to store
+  addGeoViewStore(configuration);
 
-    // add config to store
-    addGeoViewStore(configuration);
-
-    // Create a promise to be resolved when the MapViewer is initialized via the AppStart component
-    return new Promise<void>((resolve) => {
-      reactRoot[mapId].render(<AppStart mapFeaturesConfig={configuration} onMapViewerInit={(): void => resolve()} />);
-    });
-  }
-
-  // Failed
-  return Promise.reject(new Error('Failed to render the map'));
+  // Create a promise to be resolved when the MapViewer is initialized via the AppStart component
+  return new Promise<MapViewer>((resolve) => {
+    reactRoot[mapId].render(<AppStart mapFeaturesConfig={configuration} lang={lang} onMapViewerInit={resolve} />);
+  });
 }
 
 /**
@@ -228,42 +210,36 @@ async function renderMap(mapElement: Element): Promise<void> {
  * @param {HTMLElement} mapDiv - The basic div to initialise
  * @param {string} mapConfig - The new config passed in from the function call
  */
-export async function initMapDivFromFunctionCall(mapDiv: HTMLElement, mapConfig: string): Promise<void> {
-  // If the div doesn't have a geoview-map class (therefore isn't supposed to be loaded via init())
-  if (!mapDiv.classList.contains('geoview-map')) {
-    // Check if it is a url for a config file or a config string
-    const url = mapConfig.match('.json$') !== null;
+export function initMapDivFromFunctionCall(mapDiv: HTMLElement, mapConfig: string): Promise<MapViewer> {
+  // If the div has a geoview-map class (therefore is supposed to be loaded via init())
+  if (mapDiv.classList.contains('geoview-map')) throw new InitMapWrongCallError(mapDiv.id);
 
-    // Create a data-config attribute and set config value on the div
-    const att = document.createAttribute(url ? 'data-config-url' : 'data-config');
-    // Clean apostrophes in the config if not escaped already
-    att.value = mapConfig.replaceAll(/(?<!\\)'/g, "\\'");
-    mapDiv.setAttributeNode(att);
+  // Check if it is a url for a config file or a config string
+  const url = mapConfig.match('.json$') !== null;
 
-    // Set the geoview-map class on the div so that this class name is standard for all maps (either created via init or via func call)
-    mapDiv.classList.add('geoview-map');
+  // Create a data-config attribute and set config value on the div
+  const att = document.createAttribute(url ? 'data-config-url' : 'data-config');
+  // Clean apostrophes in the config if not escaped already
+  att.value = mapConfig.replaceAll(/(?<!\\)'/g, "\\'");
+  mapDiv.setAttributeNode(att);
 
-    // Add a compatibility flag on the div so that when a map is loaded via function call, it's subsequently ignored in eventual init() calls.
-    // This is useful in case that a html first calls for example `cgpv.api.createMapFromConfig('LNG1', config, divHeight);` and then
-    // calls `cgpv.init()` (let's say for other maps on the page), the map LNG1 isn't being initialized twice.
-    // Remember that init() grabs all maps with geoview-map class and we just added that class manually above, so we need that flag.
-    mapDiv.classList.add('geoview-map-func-call');
+  // Set the geoview-map class on the div so that this class name is standard for all maps (either created via init or via func call)
+  mapDiv.classList.add('geoview-map');
 
-    // Render the map
-    await renderMap(mapDiv);
-  } else {
-    // Log warning
-    logger.logWarning(`Div with id ${mapDiv.id} has a class 'geoview-map' and should be initialized via a cgpv.init() call.`);
-  }
+  // Add a compatibility flag on the div so that when a map is loaded via function call, it's subsequently ignored in eventual init() calls.
+  // This is useful in case that a html first calls for example `cgpv.api.createMapFromConfig('LNG1', config, divHeight);` and then
+  // calls `cgpv.init()` (let's say for other maps on the page), the map LNG1 isn't being initialized twice.
+  // Remember that init() grabs all maps with geoview-map class and we just added that class manually above, so we need that flag.
+  mapDiv.classList.add('geoview-map-func-call');
+
+  // Render the map
+  return renderMap(mapDiv);
 }
 
 /**
  * Initializes the cgpv and render it to root element
- *
- * @param {(mapId: string) => void} callbackMapInit optional callback function to run once the map rendering is ready
- * @param {(mapId: string) => void} callbackMapLayersLoaded optional callback function to run once layers are loaded on the map
  */
-function init(callbackMapInit?: (mapId: string) => void, callbackMapLayersLoaded?: (mapId: string) => void): void {
+function init(): void {
   const mapElements = document.getElementsByClassName('geoview-map');
 
   // loop through map elements on the page
@@ -271,7 +247,7 @@ function init(callbackMapInit?: (mapId: string) => void, callbackMapLayersLoaded
     const mapElement = mapElements[i] as Element;
     if (!mapElement.classList.contains('geoview-map-func-call')) {
       // Render the map
-      const promiseMapInit = renderMap(mapElement);
+      const promiseMapViewer = renderMap(mapElement);
 
       // The callback for the map init when the promiseMapInit will resolve
       const theCallbackMapInit = cgpvCallbackMapInit;
@@ -286,44 +262,47 @@ function init(callbackMapInit?: (mapId: string) => void, callbackMapLayersLoaded
       const theCallbackLayersLoaded = cgpvCallbackLayersLoaded;
 
       // When the map init is done
-      promiseMapInit
-        .then(() => {
+      promiseMapViewer
+        .then((theMapViewer) => {
           // Log
           const mapId = mapElement.getAttribute('id')!;
           logger.logInfo('Map initialized', mapId);
 
-          // Callback about it
-          theCallbackMapInit?.(mapId);
-          callbackMapInit?.(mapId); // TODO: Obsolete call, remove it eventually
+          try {
+            // Callback about it
+            theCallbackMapInit?.(theMapViewer);
+          } catch (error: unknown) {
+            // Log
+            logger.logError('An error happened in the initialization callback.', error);
+          }
 
           // Register when the map viewer will have a map ready
-          api.getMapViewer(mapId).onMapReady((mapViewer) => {
+          theMapViewer.onMapReady((mapViewer) => {
             logger.logInfo('Map ready / layers registered', mapViewer.mapId);
 
             // Callback for that particular map
-            theCallbackMapReady?.(mapViewer.mapId);
+            theCallbackMapReady?.(mapViewer);
           });
 
-          // Register when the map viewer will have loaded layers
-          api.getMapViewer(mapId).onMapLayersProcessed((mapViewer) => {
+          // Register when the map viewer will have processed layers
+          theMapViewer.onMapLayersProcessed((mapViewer) => {
             logger.logInfo('Map layers processed', mapViewer.mapId);
 
             // Callback for that particular map
-            theCallbackLayersProcessed?.(mapViewer.mapId);
+            theCallbackLayersProcessed?.(mapViewer);
           });
 
           // Register when the map viewer will have loaded layers
-          api.getMapViewer(mapId).onMapLayersLoaded((mapViewer) => {
+          theMapViewer.onMapLayersLoaded((mapViewer) => {
             logger.logInfo('Map layers loaded', mapViewer.mapId);
 
             // Callback for that particular map
-            theCallbackLayersLoaded?.(mapViewer.mapId);
-            callbackMapLayersLoaded?.(mapViewer.mapId); // TODO: Obsolete call, remove it eventually
+            theCallbackLayersLoaded?.(mapViewer);
           });
         })
-        .catch((error) => {
+        .catch((error: unknown) => {
           // Log
-          logger.logPromiseFailed('promiseMapInit in init in App', error);
+          logger.logPromiseFailed('promiseMapViewer in init in App', error);
         });
     }
   }
@@ -331,36 +310,36 @@ function init(callbackMapInit?: (mapId: string) => void, callbackMapLayersLoaded
 
 /**
  * Registers a callback when the map has been initialized
- * @param {(mapId: string) => void} callback - The callback to be called
+ * @param {MapViewerDelegate} callback - The callback to be called
  */
-export function onMapInit(callback: (mapId: string) => void): void {
+export function onMapInit(callback: MapViewerDelegate): void {
   // Keep the callback
   cgpvCallbackMapInit = callback;
 }
 
 /**
  * Registers a callback when the map has turned ready / layers were registered
- * @param {(mapId: string) => void} callback - The callback to be called
+ * @param {MapViewerDelegate} callback - The callback to be called
  */
-export function onMapReady(callback: (mapId: string) => void): void {
+export function onMapReady(callback: MapViewerDelegate): void {
   // Keep the callback
   cgpvCallbackMapReady = callback;
 }
 
 /**
  * Registers a callback when the layers have been processed
- * @param {(mapId: string) => void} callback - The callback to be called
+ * @param {MapViewerDelegate} callback - The callback to be called
  */
-export function onLayersProcessed(callback: (mapId: string) => void): void {
+export function onLayersProcessed(callback: MapViewerDelegate): void {
   // Keep the callback
   cgpvCallbackLayersProcessed = callback;
 }
 
 /**
  * Registers a callback when the layers have been loaded
- * @param {(mapId: string) => void} callback - The callback to be called
+ * @param {MapViewerDelegate} callback - The callback to be called
  */
-export function onLayersLoaded(callback: (mapId: string) => void): void {
+export function onLayersLoaded(callback: MapViewerDelegate): void {
   // Keep the callback
   cgpvCallbackLayersLoaded = callback;
 }

@@ -37,7 +37,6 @@ import {
   defaultColor,
   FillPaternLine,
   FillPaternSettings,
-  FilterNodeArrayType,
   FilterNodeType,
   groupKeywords,
   NodeType,
@@ -46,19 +45,21 @@ import {
 } from './geoview-renderer-types';
 import { TypeVectorLayerStyles } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
 import { logger } from '@/core/utils/logger';
-import { NotImplementedError } from '@/core/exceptions/core-exceptions';
+import { NotSupportedError } from '@/core/exceptions/core-exceptions';
+import { TypeJsonArray } from '@/api/config/types/config-types';
 
 type TypeStyleProcessor = (
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ) => Style | undefined;
 
 let colorCount = 0;
 
-/** ***************************************************************************************************************************
+/**
  * Get the default color using the default color index.
  *
  * @param {number} alpha - Alpha value to associate to the color.
@@ -74,7 +75,7 @@ function getDefaultColor(alpha: number, increment = false): string {
   return color;
 }
 
-/** ***************************************************************************************************************************
+/**
  * This method returns the type of geometry. It removes the Multi prefix because for the geoviewRenderer, a MultiPoint has
  * the same behaviour than a Point.
  *
@@ -135,7 +136,7 @@ const LEGEND_CANVAS_WIDTH = 50;
 /** Default value of the legend canvas height when the settings do not provide one. */
 const LEGEND_CANVAS_HEIGHT = 50;
 
-/** ***************************************************************************************************************************
+/**
  * This method loads the image of an icon that compose the legend.
  *
  * @param {string} src - Source information (base64 image) of the image to load.
@@ -149,7 +150,7 @@ export function loadImage(src: string): Promise<HTMLImageElement | null> {
     image
       .decode()
       .then(() => resolve(image))
-      .catch((error) => {
+      .catch((error: unknown) => {
         logger.logError('GeoviewRenderer.loadImage(src) - Error while loading the src image =', src, error);
         resolve(null);
       });
@@ -157,7 +158,7 @@ export function loadImage(src: string): Promise<HTMLImageElement | null> {
   return promisedImage;
 }
 
-/** ***************************************************************************************************************************
+/**
  * This method creates a canvas with the image of an icon that is defined in the point style.
  *
  * @param {Style} pointStyle - Style associated to the point symbol.
@@ -181,14 +182,14 @@ async function createIconCanvas(pointStyle?: Style): Promise<HTMLCanvasElement |
       return drawingCanvas;
     }
     return null;
-  } catch (error) {
+  } catch (error: unknown) {
     logger.logError(`Error creating incon canvas for pointStyle`, error);
     return null;
   }
 }
 
 // #region CREATE CANVAS
-/** ***************************************************************************************************************************
+/**
  * This method creates a canvas with the vector point settings that are defined in the point style.
  *
  * @param {Style} pointStyle - Style associated to the point symbol.
@@ -208,7 +209,7 @@ function createPointCanvas(pointStyle?: Style): HTMLCanvasElement {
   return drawingCanvas;
 }
 
-/** ***************************************************************************************************************************
+/**
  * This method creates a canvas with the lineString settings that are defined in the style.
  *
  * @param {Style} lineStringStyle - Style associated to the lineString.
@@ -238,7 +239,7 @@ function createLineStringCanvas(lineStringStyle?: Style): HTMLCanvasElement {
   return drawingCanvas;
 }
 
-/** ***************************************************************************************************************************
+/**
  * This method creates a canvas with the polygon settings that are defined in the style.
  *
  * @param {Style} polygonStyle - Style associated to the polygon.
@@ -276,7 +277,7 @@ function createPolygonCanvas(polygonStyle?: Style): HTMLCanvasElement {
 }
 // #endregion CREATE CANVAS
 
-/** ***************************************************************************************************************************
+/**
  * Create the stroke options using the specified settings.
  *
  * @param {TypeSimpleSymbolVectorConfig | TypeLineStringVectorConfig | TypePolygonVectorConfig} settings - Settings to use
@@ -303,14 +304,14 @@ function createStrokeOptions(settings: TypeSimpleSymbolVectorConfig | TypeLineSt
   return strokeOptions;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Execute an operator using the nodes on the data stack. The filter equation is evaluated using a postfix notation. The result
  * is pushed back on the data stack. If a problem is detected, an error object is thrown with an explanatory message.
  *
  * @param {FilterNodeType} operator - Operator to execute.
- * @param {FilterNodeArrayType} dataStack - Data stack to use for the operator execution.
+ * @param {FilterNodeType[]} dataStack - Data stack to use for the operator execution.
  */
-function executeOperator(operator: FilterNodeType, dataStack: FilterNodeArrayType): void {
+function executeOperator(operator: FilterNodeType, dataStack: FilterNodeType[]): void {
   if (operator.nodeType === NodeType.binary) {
     if (dataStack.length < 2 || dataStack[dataStack.length - 2].nodeValue === '(')
       throw new Error(`binary operator error - operator = '${operator.nodeValue}'`);
@@ -486,25 +487,25 @@ function executeOperator(operator: FilterNodeType, dataStack: FilterNodeArrayTyp
           else dataStack.push({ nodeType: NodeType.variable, nodeValue: operand.nodeValue.toLowerCase() });
           break;
         default:
-          throw new NotImplementedError(`unknown operator error`);
+          throw new NotSupportedError(`unknown operator error`);
       }
     }
   }
 }
 
-/** ***************************************************************************************************************************
+/**
  * Use the filter equation and the feature fields to determine if the feature is visible.
  *
  * @param {Feature} feature - Feature used to find the visibility value to return.
- * @param {FilterNodeArrayType} filterEquation - Filter used to find the visibility value to return.
+ * @param {FilterNodeType[]} filterEquation - Filter used to find the visibility value to return.
  *
  * @returns {boolean | undefined} The visibility flag for the feature specified.
  */
-function featureIsNotVisible(feature: Feature, filterEquation: FilterNodeArrayType): boolean | undefined {
-  const operatorStack: FilterNodeArrayType = [];
-  const dataStack: FilterNodeArrayType = [];
+function featureIsNotVisible(feature: Feature, filterEquation: FilterNodeType[]): boolean | undefined {
+  const operatorStack: FilterNodeType[] = [];
+  const dataStack: FilterNodeType[] = [];
 
-  const operatorAt = (index: number, stack: FilterNodeArrayType): FilterNodeType | undefined => {
+  const operatorAt = (index: number, stack: FilterNodeType[]): FilterNodeType | undefined => {
     if (index < 0 && stack.length + index >= 0) return stack[stack.length + index];
     if (index > 0 && index < stack.length) return stack[index];
     return undefined;
@@ -562,8 +563,8 @@ function featureIsNotVisible(feature: Feature, filterEquation: FilterNodeArrayTy
     )
       operatorOnTop3 = operatorAt(-2, operatorStack);
     operatorStack.pop();
-  } catch (error) {
-    throw new Error(`Invalid vector layer filter (${(error as { message: string }).message}).`);
+  } catch (error: unknown) {
+    throw new Error(`Invalid vector layer filter (${error}.`);
   }
   if (dataStack.length !== 1 || dataStack[0].nodeType !== NodeType.variable)
     throw new Error(`Invalid vector layer filter (invalid structure).`);
@@ -573,7 +574,7 @@ function featureIsNotVisible(feature: Feature, filterEquation: FilterNodeArrayTy
 
 // #region PROCESS RENDERER
 
-/** ***************************************************************************************************************************
+/**
  * Process a circle symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -595,7 +596,7 @@ function processCircleSymbol(settings: TypeSimpleSymbolVectorConfig): Style | un
   });
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a star shape symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -624,7 +625,7 @@ function processStarShapeSymbol(settings: TypeSimpleSymbolVectorConfig, points: 
   });
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a star symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -635,7 +636,7 @@ function processStarSymbol(settings: TypeSimpleSymbolVectorConfig): Style | unde
   return processStarShapeSymbol(settings, 5, 0);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a X symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -646,7 +647,7 @@ function processXSymbol(settings: TypeSimpleSymbolVectorConfig): Style | undefin
   return processStarShapeSymbol(settings, 4, Math.PI / 4);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a + symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -657,7 +658,7 @@ function processPlusSymbol(settings: TypeSimpleSymbolVectorConfig): Style | unde
   return processStarShapeSymbol(settings, 4, 0);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a regular shape using the settings, the number of points, the angle and the scale.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -692,7 +693,7 @@ function processRegularShape(
   });
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a square symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -703,7 +704,7 @@ function processSquareSymbol(settings: TypeSimpleSymbolVectorConfig): Style | un
   return processRegularShape(settings, 4, Math.PI / 4, [1, 1]);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a Diamond symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -714,7 +715,7 @@ function processDiamondSymbol(settings: TypeSimpleSymbolVectorConfig): Style | u
   return processRegularShape(settings, 4, 0, [0.75, 1]);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a triangle symbol using the settings.
  *
  * @param {TypeSimpleSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -725,7 +726,7 @@ function processTriangleSymbol(settings: TypeSimpleSymbolVectorConfig): Style | 
   return processRegularShape(settings, 3, 0, [1, 1]);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process an icon symbol using the settings.
  *
  * @param {TypeIconSymbolVectorConfig} settings - Settings to use for the Style creation.
@@ -755,19 +756,19 @@ const processSymbol: Record<TypeSymbol, (settings: TypeSimpleSymbolVectorConfig)
   star: processStarSymbol,
 };
 
-/** ***************************************************************************************************************************
+/**
  * Process a simple point symbol using the settings. Simple point symbol may be an icon or a vector symbol.
  *
  * @param {TypeLayerStyleSettings | TypeKindOfVectorSettings} styleSettings - Settings to use for the Style creation.
  * @param {Feature} feature - Optional feature. This method does not use it, it is there to have a homogeneous signature.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  *
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processSimplePoint(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType
+  filterEquation?: FilterNodeType[]
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
     if (featureIsNotVisible(feature, filterEquation!)) return undefined;
@@ -781,19 +782,19 @@ function processSimplePoint(
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a simple lineString using the settings.
  *
  * @param {TypeStyleSettings | TypeKindOfVectorSettings} styleSettings - Settings to use for the Style creation.
  * @param {Feature} feature - Optional feature. This method does not use it, it is there to have a homogeneous signature.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  *
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processSimpleLineString(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType
+  filterEquation?: FilterNodeType[]
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
     if (featureIsNotVisible(feature, filterEquation!)) return undefined;
@@ -810,7 +811,7 @@ function processSimpleLineString(
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a simple solid fill (polygon) using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -829,7 +830,7 @@ function processSolidFill(settings: TypePolygonVectorConfig, geometry?: Geometry
   });
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a null fill (polygon with fill opacity = 0) using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -848,7 +849,7 @@ function processNullFill(settings: TypePolygonVectorConfig, geometry?: Geometry)
   });
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a pattern fill using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -894,7 +895,7 @@ function processPaternFill(settings: TypePolygonVectorConfig, fillPaternLines: F
   });
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a backward diagonal fill using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -905,7 +906,7 @@ function processBackwardDiagonalFill(settings: TypePolygonVectorConfig, geometry
   return processPaternFill(settings, fillPaternSettings.backwardDiagonal, geometry);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a forward diagonal fill using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -916,7 +917,7 @@ function processForwardDiagonalFill(settings: TypePolygonVectorConfig, geometry?
   return processPaternFill(settings, fillPaternSettings.forwardDiagonal, geometry);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a cross fill using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -927,7 +928,7 @@ function processCrossFill(settings: TypePolygonVectorConfig, geometry?: Geometry
   return processPaternFill(settings, fillPaternSettings.cross, geometry);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a diagonal cross fill using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -938,7 +939,7 @@ function processDiagonalCrossFill(settings: TypePolygonVectorConfig, geometry?: 
   return processPaternFill(settings, fillPaternSettings.diagonalCross, geometry);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a horizontal fill using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -949,7 +950,7 @@ function processHorizontalFill(settings: TypePolygonVectorConfig, geometry?: Geo
   return processPaternFill(settings, fillPaternSettings.horizontal, geometry);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process a vertical fill using the settings.
  *
  * @param {TypePolygonVectorConfig} settings - Settings to use for the Style creation.
@@ -972,19 +973,19 @@ const processFillStyle: Record<TypeFillStyle, (settings: TypePolygonVectorConfig
   vertical: processVerticalFill,
 };
 
-/** ***************************************************************************************************************************
+/**
  * Process a simple polygon using the settings.
  *
  * @param {TypeStyleSettings | TypeKindOfVectorSettings} styleSettings - Settings to use for the Style creation.
  * @param {Feature} feature - Optional feature. This method does not use it, it is there to have a homogeneous signature.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  *
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processSimplePolygon(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType
+  filterEquation?: FilterNodeType[]
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
     if (featureIsNotVisible(feature, filterEquation!)) return undefined;
@@ -1006,7 +1007,7 @@ function processSimplePolygon(
 
 // #endregion PROCESS RENDERER
 
-/** ***************************************************************************************************************************
+/**
  * This method is used to process the array of point styles as described in the pointStyleConfig.
  *
  * @param {TypeVectorLayerStyles} layerStyle - Object that will receive the created canvas.
@@ -1041,13 +1042,13 @@ async function processArrayOfPointStyleConfig(
       styleArray.push(canvas);
     });
     return layerStyles;
-  } catch (error) {
+  } catch (error: unknown) {
     logger.logError('Error processing array of point styles', error);
     return {} as TypeVectorLayerStyles;
   }
 }
 
-/** ***************************************************************************************************************************
+/**
  * This method is a private sub routine used by the getLegendStyles method to gets the style of the layer as specified by the
  * style configuration.
  *
@@ -1092,13 +1093,13 @@ async function getPointStyleSubRoutine(
 
     layerStyles.Point!.arrayOfCanvas = [];
     return await processArrayOfPointStyleConfig(layerStyles, arrayOfPointStyleConfig!);
-  } catch (error) {
+  } catch (error: unknown) {
     logger.logError('Error getPointStyle sub routine', error);
     return {} as TypeVectorLayerStyles;
   }
 }
 
-/** ***************************************************************************************************************************
+/**
  * This method gets the legend styles used by the the layer as specified by the style configuration.
  *
  * @param {TypeStyleConfig} styleConfig - The style configuration.
@@ -1168,13 +1169,13 @@ export async function getLegendStyles(styleConfig: TypeLayerStyleConfig | undefi
       legendStyles.Polygon = layerStyles.Polygon;
     }
     return legendStyles;
-  } catch (error) {
+  } catch (error: unknown) {
     logger.logError('Error getLegendStyles', error);
     return {};
   }
 }
 
-/** ***************************************************************************************************************************
+/**
  * Create a default style to use with a vector feature that has no style configuration.
  *
  * @param {TypeStyleGeometry} geometryType - Type of geometry (Point, LineString, Polygon).
@@ -1216,67 +1217,104 @@ function createDefaultStyle(geometryType: TypeStyleGeometry, label: string): Typ
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Search the unique value entry using the field values stored in the feature.
  *
  * @param {string[]} fields - Fields involved in the unique value definition.
- * @param {TypeLayerStyleConfigInfo[]} uniqueValueStyleInfo - Unique value configuration.
- * @param {Feature} feature - Feature used to test the unique value conditions.
- *
- * @returns {Style | undefined} The Style created. Undefined if unable to create it.
+ * @param {TypeLayerStyleConfigInfo[]?} uniqueValueStyleInfo - Unique value configuration.
+ * @param {Feature?} feature - Feature used to test the unique value conditions.
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
+ * @returns {TypeLayerStyleConfigInfo | undefined} The Style created. Undefined if unable to create it.
  */
 function searchUniqueValueEntry(
   fields: string[],
   uniqueValueStyleInfo: TypeLayerStyleConfigInfo[],
-  feature: Feature,
+  feature?: Feature,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
-): number | undefined {
-  for (let i = 0; i < uniqueValueStyleInfo.length; i++) {
-    for (let j = 0, isEqual = true; j < fields.length && isEqual; j++) {
-      // For obscure reasons, it seems that sometimes the field names in the feature do not have the same case as those in the
-      // unique value definition.
-      let fieldName = feature.getKeys().find((key) => {
-        return key.toLowerCase() === fields[j]?.toLowerCase();
-      });
+): TypeLayerStyleConfigInfo | undefined {
+  // If no feature
+  if (!feature) return undefined;
 
-      // Failed to find match: Attempt to find the alias from the names
-      if (!fieldName && aliasLookup && Object.keys(aliasLookup).length > 0) {
-        if (fields[j] in aliasLookup) {
-          fieldName = aliasLookup[fields[j]];
+  // Get the feature keys
+  const featureKeys = feature.getKeys();
+
+  // Start looping on the unique value style to find
+  for (let i = 0; i < uniqueValueStyleInfo.length; i++) {
+    // Start looping on the fields
+    let allFieldsMatched = true;
+    for (let j = 0; j < fields.length; j++) {
+      const field = fields[j];
+      const expectedRawValue = uniqueValueStyleInfo[i].values[j];
+      const expectedValue = typeof expectedRawValue === 'string' ? expectedRawValue.replace("''", "'") : expectedRawValue;
+
+      // Get the target field name: check case-insensitive match in feature keys
+      let fieldName = featureKeys.find((key) => key.toLowerCase() === field.toLowerCase());
+
+      // Try alias if no match found, then re-validate the alias key against feature keys
+      if (!fieldName && aliasLookup?.[field]) {
+        const alias = aliasLookup[field];
+        fieldName = featureKeys.find((key) => key.toLowerCase() === alias.toLowerCase());
+      }
+
+      if (!fieldName) {
+        logger.logWarning(`Renderer searchUniqueValueEntry: Cannot find field "${field}"`);
+        return undefined;
+      }
+
+      // Read the actual value
+      let actualValue = feature.get(fieldName);
+
+      // First try direct match
+      // eslint-disable-next-line eqeqeq
+      let matched = actualValue == expectedValue;
+
+      // If not matched, check coded domain
+      if (!matched) {
+        const fieldDomain = domainsLookup?.find((domain) => domain.name === fieldName)?.domain;
+        if (fieldDomain?.codedValues) {
+          const codedValue = (fieldDomain.codedValues as TypeJsonArray).find((dom) => dom.name === actualValue);
+          if (codedValue) {
+            actualValue = codedValue.code;
+            // eslint-disable-next-line eqeqeq
+            matched = actualValue == expectedValue;
+          }
         }
       }
 
-      if (fieldName) {
-        const styleInfoValue =
-          typeof uniqueValueStyleInfo[i].values[j] === 'string'
-            ? (uniqueValueStyleInfo[i].values[j] as string).replace("''", "'")
-            : uniqueValueStyleInfo[i].values[j];
-        // We want type conversion for the values, so '1234' equals 1234
-        // eslint-disable-next-line eqeqeq
-        isEqual = feature.get(fieldName) == styleInfoValue;
-        if (isEqual && j + 1 === fields.length) return i;
-      } else logger.logWarning(`Renderer searchUniqueValueEntry. Can not find field ${fields[j]}`);
+      // If this field did not match, mark the whole thing as a mismatch
+      if (!matched) {
+        allFieldsMatched = false;
+        break;
+      }
+    }
+
+    if (allFieldsMatched) {
+      return uniqueValueStyleInfo[i];
     }
   }
 
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process the unique value settings using a point feature to get its Style.
  *
  * @param {TypeStyleSettings | TypeKindOfVectorSettings} styleSettings - Style settings to use.
- * @param {Feature} feature - Feature used to test the unique value conditions.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
- * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
- *
+ * @param {Feature?} feature - Feature used to test the unique value conditions.
+ * @param {FilterNodeType[]?} filterEquation - Filter equation associated to the layer.
+ * @param {boolean?} legendFilterIsOff - When true, do not apply legend filter.
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processUniqueValuePoint(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
@@ -1284,29 +1322,37 @@ function processUniqueValuePoint(
 
   if (styleSettings.type === 'uniqueValue') {
     const { hasDefault, fields, info } = styleSettings;
-    const i = searchUniqueValueEntry(fields, info, feature!, aliasLookup);
-    if (i !== undefined && (legendFilterIsOff || info[i].visible !== false)) return processSimplePoint(info[i].settings);
-    if (i === undefined && hasDefault && (legendFilterIsOff || styleSettings.info[styleSettings.info.length - 1].visible !== false))
+    const styleEntry = searchUniqueValueEntry(fields, info, feature, domainsLookup, aliasLookup);
+    if (styleEntry !== undefined && (legendFilterIsOff || styleEntry.visible !== false)) return processSimplePoint(styleEntry.settings);
+
+    // TODO: Check - Why look for styleSettings.info.length - 1?
+    if (
+      styleEntry === undefined &&
+      hasDefault &&
+      (legendFilterIsOff || styleSettings.info[styleSettings.info.length - 1].visible !== false)
+    )
       return processSimplePoint(styleSettings.info[styleSettings.info.length - 1].settings);
   }
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process the unique value settings using a lineString feature to get its Style.
  *
  * @param {TypeLayerStyleSettings | TypeKindOfVectorSettings} styleSettings - Style settings to use.
- * @param {Feature} feature - Feature used to test the unique value conditions.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
- * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
- *
+ * @param {Feature?} feature - Feature used to test the unique value conditions.
+ * @param {FilterNodeType[]?} filterEquation - Filter equation associated to the layer.
+ * @param {boolean?} legendFilterIsOff - When true, do not apply legend filter.
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processUniqueLineString(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
@@ -1314,29 +1360,34 @@ function processUniqueLineString(
 
   if (styleSettings.type === 'uniqueValue') {
     const { hasDefault, fields, info } = styleSettings;
-    const i = searchUniqueValueEntry(fields, info, feature!, aliasLookup);
-    if (i !== undefined && (legendFilterIsOff || info[i].visible !== false)) return processSimpleLineString(info[i].settings, feature);
-    if (i === undefined && hasDefault && (legendFilterIsOff || info[info.length - 1].visible !== false))
+    const styleEntry = searchUniqueValueEntry(fields, info, feature, domainsLookup, aliasLookup);
+    if (styleEntry !== undefined && (legendFilterIsOff || styleEntry.visible !== false))
+      return processSimpleLineString(styleEntry.settings, feature);
+
+    // TODO: Check - Why look for info.length - 1?
+    if (styleEntry === undefined && hasDefault && (legendFilterIsOff || info[info.length - 1].visible !== false))
       return processSimpleLineString(info[info.length - 1].settings, feature);
   }
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process the unique value settings using a polygon feature to get its Style.
  *
  * @param {TypeLayerStyleSettings | TypeKindOfVectorSettings} styleSettings - Style settings to use.
- * @param {Feature} feature - Feature used to test the unique value conditions.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {Feature?} feature - Feature used to test the unique value conditions.
+ * @param {FilterNodeType[]?} filterEquation - Filter equation associated to the layer.
  * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
- *
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processUniquePolygon(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
@@ -1344,21 +1395,24 @@ function processUniquePolygon(
 
   if (styleSettings.type === 'uniqueValue') {
     const { hasDefault, fields, info } = styleSettings;
-    const i = searchUniqueValueEntry(fields, info, feature!, aliasLookup);
-    if (i !== undefined && (legendFilterIsOff || info[i].visible !== false)) return processSimplePolygon(info[i].settings, feature);
-    if (i === undefined && hasDefault && (legendFilterIsOff || info[info.length - 1].visible !== false))
+    const styleEntry = searchUniqueValueEntry(fields, info, feature, domainsLookup, aliasLookup);
+    if (styleEntry !== undefined && (legendFilterIsOff || styleEntry.visible !== false))
+      return processSimplePolygon(styleEntry.settings, feature);
+
+    // TODO: Check - Why look for info.length - 1?
+    if (styleEntry === undefined && hasDefault && (legendFilterIsOff || info[info.length - 1].visible !== false))
       return processSimplePolygon(info[info.length - 1].settings, feature);
   }
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Search the class breakentry using the field value stored in the feature.
  *
  * @param {string} field - Field involved in the class break definition.
  * @param {TypeLayerStyleConfigInfo[]} classBreakStyleInfo - Class break configuration.
  * @param {Feature} feature - Feature used to test the class break conditions.
- *
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {number | undefined} The index of the entry. Undefined if unable to find it.
  */
 function searchClassBreakEntry(
@@ -1392,21 +1446,23 @@ function searchClassBreakEntry(
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process the class break settings using a Point feature to get its Style.
  *
  * @param {TypeLayerStyleSettings | TypeKindOfVectorSettings} styleSettings - Style settings to use.
  * @param {Feature} feature - Feature used to test the unique value conditions.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
- *
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processClassBreaksPoint(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
@@ -1422,21 +1478,23 @@ function processClassBreaksPoint(
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process the class break settings using a lineString feature to get its Style.
  *
  * @param {TypeStyleSettings | TypeKindOfVectorSettings} styleSettings - Style settings to use.
  * @param {Feature} feature - Feature used to test the unique value conditions.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
- *
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processClassBreaksLineString(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
@@ -1452,21 +1510,23 @@ function processClassBreaksLineString(
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Process the class break settings using a Polygon feature to get its Style.
  *
  * @param {TypeLayerStyleSettings | TypeKindOfVectorSettings} styleSettings - Style settings to use.
  * @param {Feature} feature - Feature used to test the unique value conditions.
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
- *
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {Style | undefined} The Style created. Undefined if unable to create it.
  */
 function processClassBreaksPolygon(
   styleSettings: TypeLayerStyleSettings | TypeKindOfVectorSettings,
   feature?: Feature,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ): Style | undefined {
   if (filterEquation !== undefined && filterEquation.length !== 0 && feature)
@@ -1510,14 +1570,15 @@ export const processStyle: Record<TypeLayerStyleConfigType, Record<TypeStyleGeom
   },
 };
 
-/** ***************************************************************************************************************************
+/**
  * This method gets the style of the feature using the layer entry config. If the style does not exist for the geometryType,
  * create it using the default style strategy.
  * @param {FeatureLike} feature - Feature that need its style to be defined.
  * @param {TypeStyleConfig} style - The style to use
  * @param {string} label - The style label when one has to be created
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @param {() => Promise<string | null>} callbackWhenCreatingStyle - An optional callback to execute when a new style had to be created
  * @returns {Style | undefined} The style applied to the feature or undefined if not found.
  */
@@ -1525,7 +1586,7 @@ export function getAndCreateFeatureStyle(
   feature: FeatureLike,
   style: TypeLayerStyleConfig,
   label: string,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
   aliasLookup?: TypeAliasLookup,
   callbackWhenCreatingStyle?: (geometryType: TypeStyleGeometry, style: TypeLayerStyleConfigInfo) => void
@@ -1560,6 +1621,7 @@ export function getAndCreateFeatureStyle(
       feature as Feature,
       filterEquation,
       legendFilterIsOff,
+      undefined,
       aliasLookup
     );
 
@@ -1569,19 +1631,22 @@ export function getAndCreateFeatureStyle(
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * This method gets the image source from the style of the feature using the layer entry config.
  * @param {Feature} feature - The feature that need its icon to be defined.
  * @param {TypeStyleConfig} style - The style to use
- * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+ * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
  * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
+ * @param {TypeJsonArray?} domainsLookup - An optional lookup table to handle coded value domains.
+ * @param {TypeAliasLookup?} aliasLookup - An optional lookup table to handle field name aliases.
  * @returns {string} The icon associated to the feature or a default empty one.
  */
 export function getFeatureImageSource(
   feature: Feature,
   style: TypeLayerStyleConfig,
-  filterEquation?: FilterNodeArrayType,
+  filterEquation?: FilterNodeType[],
   legendFilterIsOff?: boolean,
+  domainsLookup?: TypeJsonArray,
   aliasLookup?: TypeAliasLookup
 ): string | undefined {
   // The image source that will be returned (if calculated successfully)
@@ -1614,7 +1679,14 @@ export function getFeatureImageSource(
       //   });
       // });
 
-      const featureStyle = processStyle[type][geometryType](styleSettings, feature, filterEquation, legendFilterIsOff, aliasLookup);
+      const featureStyle = processStyle[type][geometryType](
+        styleSettings,
+        feature,
+        filterEquation,
+        legendFilterIsOff,
+        domainsLookup,
+        aliasLookup
+      );
 
       if (featureStyle) {
         if (geometryType === 'Point') {
@@ -1642,16 +1714,16 @@ export function getFeatureImageSource(
   return undefined;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Classify the remaining nodes to complete the classification. The plus and minus can be a unary or a binary operator. It is
  * only at the end that we can determine there node type. Nodes that start with a number are numbers, otherwise they are
  * variables. If a problem is detected, an error object is thrown with an explanatory message.
  *
- * @param {FilterNodeArrayType} keywordArray - Array of keywords to process.
+ * @param {FilterNodeType[]} keywordArray - Array of keywords to process.
  *
- * @returns {FilterNodeArrayType} The new keywords array with all nodes classified.
+ * @returns {FilterNodeType[]} The new keywords array with all nodes classified.
  */
-function classifyUnprocessedNodes(keywordArray: FilterNodeArrayType): FilterNodeArrayType {
+function classifyUnprocessedNodes(keywordArray: FilterNodeType[]): FilterNodeType[] {
   return keywordArray.map((node, i) => {
     if (node.nodeType === NodeType.unprocessedNode) {
       if (Number.isNaN(Number((node.nodeValue as string).slice(0, 1)))) {
@@ -1687,17 +1759,17 @@ function classifyUnprocessedNodes(keywordArray: FilterNodeArrayType): FilterNode
   });
 }
 
-/** ***************************************************************************************************************************
+/**
  * Extract the specified keyword and associate a node type to their nodes. In some cases, the extraction uses an optionally
  * regular expression.
  *
- * @param {FilterNodeArrayType} FilterNodeArrayType - Array of keywords to process.
+ * @param {FilterNodeType[]} FilterNodeArrayType - Array of keywords to process.
  * @param {string} keyword - Keyword to extract.
  * @param {RegExp} regExp - An optional regular expression to use for the extraction.
  *
- * @returns {FilterNodeArrayType} The new keywords array.
+ * @returns {FilterNodeType[]} The new keywords array.
  */
-function extractKeyword(filterNodeArray: FilterNodeArrayType, keyword: string, regExp?: RegExp): FilterNodeArrayType {
+function extractKeyword(filterNodeArray: FilterNodeType[], keyword: string, regExp?: RegExp): FilterNodeType[] {
   // eslint-disable-next-line no-nested-ternary
   const getNodeType = (keywordValue: string): NodeType => {
     if (['+', '-'].includes(keywordValue)) return NodeType.unprocessedNode;
@@ -1723,24 +1795,24 @@ function extractKeyword(filterNodeArray: FilterNodeArrayType, keyword: string, r
             nodeArray.push({ nodeType: NodeType.unprocessedNode, nodeValue: splitNode.trim() });
             nodeArray.push({ nodeType: getNodeType(keyword), nodeValue: keyword });
             return nodeArray;
-          }, [] as FilterNodeArrayType)
+          }, [] as FilterNodeType[])
           .slice(0, -1)
       );
     }
     return newKeywordArray;
-  }, [] as FilterNodeArrayType);
+  }, [] as FilterNodeType[]);
 }
 
-/** ***************************************************************************************************************************
+/**
  * Extract the string nodes from the keyword array. This operation is done at the beginning of the classification. This allows
  * to considere Keywords in a string as a normal word. If a problem is detected, an error object is thrown with an explanatory
  * message.
  *
- * @param {FilterNodeArrayType} keywordArray - Array of keywords to process.
+ * @param {FilterNodeType[]} keywordArray - Array of keywords to process.
  *
- * @returns {FilterNodeArrayType} The new keywords array with all string nodes classified.
+ * @returns {FilterNodeType[]} The new keywords array with all string nodes classified.
  */
-function extractStrings(keywordArray: FilterNodeArrayType): FilterNodeArrayType {
+function extractStrings(keywordArray: FilterNodeType[]): FilterNodeType[] {
   let stringNeeded = false;
   let stringHasBegun = false;
   let contiguousApostrophes = 0;
@@ -1774,22 +1846,22 @@ function extractStrings(keywordArray: FilterNodeArrayType): FilterNodeArrayType 
       stringNeeded = true;
     } else newKeywordArray.push(node);
     return newKeywordArray;
-  }, [] as FilterNodeArrayType);
+  }, [] as FilterNodeType[]);
   if (stringHasBegun)
     if (!stringNeeded && contiguousApostrophes === 1) keywordArrayToReturn.push({ nodeType: NodeType.string, nodeValue: stringValue });
     else throw new Error(`string not closed`);
   return keywordArrayToReturn;
 }
 
-/** ***************************************************************************************************************************
+/**
  * Analyse the filter and split it in syntaxique nodes.  If a problem is detected, an error object is thrown with an
  * explanatory message.
  *
- * @param {FilterNodeArrayType} filterNodeArrayType - Node array to analyse.
+ * @param {FilterNodeType[]} filterNodeArrayType - Node array to analyse.
  *
- * @returns {FilterNodeArrayType} The new node array with all nodes classified.
+ * @returns {FilterNodeType[]} The new node array with all nodes classified.
  */
-export function analyzeLayerFilter(filterNodeArrayType: FilterNodeArrayType): FilterNodeArrayType {
+export function analyzeLayerFilter(filterNodeArrayType: FilterNodeType[]): FilterNodeType[] {
   let resultingKeywordArray = filterNodeArrayType;
   resultingKeywordArray[0].nodeValue = (resultingKeywordArray[0].nodeValue as string).replaceAll(/\s{2,}/g, ' ').trim();
   resultingKeywordArray[0].nodeValue = resultingKeywordArray[0].nodeValue.split(/^date '|(?<=\s)date '/gi).join("date°'");

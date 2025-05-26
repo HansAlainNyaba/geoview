@@ -37,19 +37,18 @@ import TopToolbar from './top-toolbar';
 import { useMapStoreActions } from '@/core/stores/store-interface-and-intial-values/map-state';
 import { useLayerStoreActions } from '@/core/stores/store-interface-and-intial-values/layer-state';
 import { useDataTableStoreActions, useDataTableLayerSettings } from '@/core/stores/store-interface-and-intial-values/data-table-state';
-import { useAppDisplayLanguage, useAppFullscreenActive } from '@/core/stores/store-interface-and-intial-values/app-state';
-import { useUIFooterPanelResizeValue, useUIStoreActions } from '@/core/stores/store-interface-and-intial-values/ui-state';
+import { useAppDisplayLanguage, useAppShowUnsymbolizedFeatures } from '@/core/stores/store-interface-and-intial-values/app-state';
+import { useUIStoreActions } from '@/core/stores/store-interface-and-intial-values/ui-state';
 import { DateMgt } from '@/core/utils/date-mgt';
 import { isImage, delay } from '@/core/utils/utilities';
 import { logger } from '@/core/utils/logger';
-import { TypeFeatureInfoEntry } from '@/api/config/types/map-schema-types';
+import { CONST_LAYER_TYPES, TypeFeatureInfoEntry } from '@/api/config/types/map-schema-types';
 import { useFilterRows, useToolbarActionMessage, useGlobalFilter } from './hooks';
 import { getSxClasses } from './data-table-style';
 import { useLightBox } from '@/core/components/common';
 import { NUMBER_FILTER, DATE_FILTER, STRING_FILTER } from '@/core/utils/constant';
 import { DataTableProps, ColumnsType } from './data-table-types';
 import { VALID_DISPLAY_LANGUAGE } from '@/api/config/types/config-constants';
-import { CONST_LAYER_TYPES } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
 
 /**
  * Build Data table from map.
@@ -73,8 +72,7 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
   const { getExtentFromFeatures } = useLayerStoreActions();
   const language = useAppDisplayLanguage();
   const datatableSettings = useDataTableLayerSettings();
-  const isMapFullScreen = useAppFullscreenActive();
-  const footerPanelResizeValue = useUIFooterPanelResizeValue();
+  const showUnsymbolizedFeatures = useAppShowUnsymbolizedFeatures();
 
   // internal state
   const [density, setDensity] = useState<MRTDensityState>('compact');
@@ -310,10 +308,18 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
           ? Object.keys(feature.fieldInfo).find((key) => feature.fieldInfo[key]!.dataType === 'oid') || undefined
           : undefined;
 
-      // If there is no extent, the layer is ESRI Dynamic, get the feature extent using its oid field
-      if (!extent && oidField !== undefined)
-        extent = await getExtentFromFeatures(layerPath, [feature.fieldInfo[oidField]!.value as string], oidField);
+      // If there is no extent, but there's an OID field (ESRI Dynamic layer?)
+      if (!extent && oidField !== undefined) {
+        try {
+          // Get the feature extent using its oid field
+          extent = await getExtentFromFeatures(layerPath, [feature.fieldInfo[oidField]!.value as string], oidField);
+        } catch (error: unknown) {
+          // Log error
+          logger.logError(error);
+        }
+      }
 
+      // If the extent was found
       if (extent) {
         // Project
         const center = getCenter(extent);
@@ -361,7 +367,13 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
     logger.logTraceUseMemo('DATA-TABLE - rows', data.features);
 
     // get filtered feature for unique value info style so non visible class is not in the table
-    const filterArray = getFilteredDataFromLegendVisibility(data.layerPath, data?.features ?? []);
+    let filterArray = getFilteredDataFromLegendVisibility(data.layerPath, data?.features ?? []);
+
+    // Filter out unsymbolized features if the showUnsymbolizedFeatures config is false
+    if (!showUnsymbolizedFeatures) {
+      // eslint-disable-next-line no-param-reassign
+      filterArray = filterArray.filter((record) => record.featureIcon);
+    }
 
     return (filterArray ?? []).map((feature) => {
       const icon = feature.featureIcon ? (
@@ -419,6 +431,7 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
   // Decide between using a controlled or uncontrolled input element for the lifetime of the component. More info: https://reactjs.org/link/controlled-components Error Component Stack
 
   let useTable: MRTTableInstance<ColumnsType> | null = null;
+
   // Create the Material React Table
   useTable = useMaterialReactTable({
     columns,
@@ -472,7 +485,7 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
     enableRowVirtualization: true,
     muiTableContainerProps: {
       sx: {
-        maxHeight: isMapFullScreen ? `calc(${footerPanelResizeValue}vh - 240px)` : '425px', // TODO: set 425px when not in full screen. Even FS should use the footerPanelResizeValue
+        maxHeight: 'calc(100% - 97px)', // 97px is the height of the data table header. Setting max height prevents the containing columns scrollbars from triggering
       },
     },
     rowVirtualizerInstanceRef,
@@ -497,6 +510,7 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
     muiTablePaperProps: ({ table }) => ({
       style: {
         zIndex: table.getState().isFullScreen ? 999999 : undefined,
+        height: '100%',
       },
     }),
     muiTableBodyProps: {
@@ -526,7 +540,7 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
       if (rowsCount > 0) {
         rowVirtualizerInstanceRef.current?.scrollToIndex?.(0);
       }
-    } catch (error) {
+    } catch (error: unknown) {
       logger.logError('Data table error on sorting action', error);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -628,10 +642,10 @@ function DataTable({ data, layerPath }: DataTableProps): JSX.Element {
   }, [datatableSettings[layerPath].mapFilteredRecord]);
 
   // set toolbar custom action message in store.
-  useToolbarActionMessage({ data, columnFilters, globalFilter, layerPath, tableInstance: useTable });
+  useToolbarActionMessage({ data, columnFilters, globalFilter, layerPath, tableInstance: useTable, showUnsymbolizedFeatures });
 
   return (
-    <Box sx={sxClasses.dataTableWrapper}>
+    <Box sx={sxClasses.dataTableWrapper} className="data-table-wrapper">
       <LocalizationProvider dateAdapter={AdapterDayjs} adapterLocale={language}>
         <MaterialReactTable table={useTable} />
       </LocalizationProvider>

@@ -5,21 +5,17 @@ import {
   TypeFeatureInfoEntry,
   TypeStyleGeometry,
   layerEntryIsGroupLayer,
-} from '@/api/config/types/map-schema-types';
-import { TypeLegendLayer, TypeLegendLayerItem, TypeLegendItem } from '@/core/components/layers/types';
-import {
   CONST_LAYER_TYPES,
   TypeGeoviewLayerType,
-  TypeWmsLegend,
-  isImageStaticLegend,
-  isVectorLegend,
-  isWmsLegend,
-} from '@/geo/layer/geoview-layers/abstract-geoview-layers';
+} from '@/api/config/types/map-schema-types';
+import { TypeLegendLayer, TypeLegendLayerItem, TypeLegendItem } from '@/core/components/layers/types';
+import { TypeWmsLegend, isImageStaticLegend, isVectorLegend, isWmsLegend } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
 import { ConfigBaseClass } from '@/core/utils/config/validation-classes/config-base-class';
 import { ILayerState, TypeLegend, TypeLegendResultSetEntry } from '@/core/stores/store-interface-and-intial-values/layer-state';
 import { AbstractEventProcessor } from '@/api/event-processors/abstract-event-processor';
 import { AbstractBaseLayerEntryConfig } from '@/core/utils/config/validation-classes/abstract-base-layer-entry-config';
-import { MapEventProcessor } from './map-event-processor';
+import { MapEventProcessor } from '@/api/event-processors/event-processor-children/map-event-processor';
+import { LayerNotFoundError } from '@/core/exceptions/layer-exceptions';
 
 // GV Important: See notes in header of MapEventProcessor file for information on the paradigm to apply when working with UIEventProcessor vs UIState
 
@@ -118,6 +114,47 @@ export class LegendEventProcessor extends AbstractEventProcessor {
   }
 
   /**
+   * Retrieves the default filter configuration for a specific layer entry.
+   *
+   * @param {string} mapId - The unique identifier of the map instance.
+   * @param {string} layerPath - The path to the layer in the map configuration.
+   * @returns {string | undefined} - The default filter for the layer entry, or `undefined` if not available.
+   *
+   * @description
+   * This method fetches the layer entry configuration for the specified layer path and checks if it contains a `layerFilter` property.
+   * If the property exists, its value is returned; otherwise, `undefined` is returned.
+   */
+  static getLayerEntryConfigDefaultFilter(mapId: string, layerPath: string): string | undefined {
+    const entryConfig = MapEventProcessor.getMapViewerLayerAPI(mapId).getLayerEntryConfig(layerPath) as AbstractBaseLayerEntryConfig;
+
+    // Check if entryConfig exists and has layerFilter property
+    return entryConfig && 'layerFilter' in entryConfig ? (entryConfig.layerFilter as string) : undefined;
+  }
+
+  /**
+   * Retrieves the projection code for a specific layer.
+   *
+   * @param {string} mapId - The unique identifier of the map instance.
+   * @param {string} layerPath - The path to the layer.
+   * @returns {string | undefined} - The projection code of the layer, or `undefined` if not available.
+   *
+   * @description
+   * This method fetches the Geoview layer for the specified layer path and checks if it has a `getMetadataProjection` method.
+   * If the method exists, it retrieves the projection object and returns its code using the `getCode` method.
+   * If the projection or its code is not available, the method returns `undefined`.
+   */
+  static getLayerServiceProjection(mapId: string, layerPath: string): string | undefined {
+    const geoviewLayer = MapEventProcessor.getMapViewerLayerAPI(mapId).getGeoviewLayer(layerPath);
+
+    if (geoviewLayer && 'getMetadataProjection' in geoviewLayer && typeof geoviewLayer.getMetadataProjection === 'function') {
+      const projection = geoviewLayer.getMetadataProjection();
+      return projection && typeof projection.getCode === 'function' ? projection.getCode() : undefined;
+    }
+
+    return undefined;
+  }
+
+  /**
    * Sets the layer bounds for a layer path
    * @param {string} mapId - The map id
    * @param {string} layerPath - The layer path
@@ -137,20 +174,33 @@ export class LegendEventProcessor extends AbstractEventProcessor {
   }
 
   /**
+   * Sets the layersAreLoading flag in the store
+   * @param {string} mapId - The map id
+   * @param {boolean} areLoading - Indicator if any layer is currently loading
+   */
+  static setLayersAreLoading(mapId: string, areLoading: boolean): void {
+    // Update the store
+    this.getLayerState(mapId).setterActions.setLayersAreLoading(areLoading);
+  }
+
+  /**
    * Gets the extent of a feature or group of features
    * @param {string} mapId - The map identifier
    * @param {string} layerPath - The layer path
    * @param {string[]} objectIds - The IDs of features to get extents from.
    * @param {string} outfield - ID field to return for services that require a value in outfields.
-   * @returns {Promise<Extent | undefined>} The extent of the feature, if available
+   * @returns {Promise<Extent>} The extent of the feature, if available
    */
-  static getExtentFromFeatures(
-    mapId: string,
-    layerPath: string,
-    objectIds: string[],
-    outfield?: string
-  ): Promise<Extent | undefined> | undefined {
-    return MapEventProcessor.getMapViewerLayerAPI(mapId).getGeoviewLayer(layerPath)?.getExtentFromFeatures(objectIds, outfield);
+  static getExtentFromFeatures(mapId: string, layerPath: string, objectIds: string[], outfield?: string): Promise<Extent> {
+    // Get the layer api
+    const layerApi = MapEventProcessor.getMapViewerLayerAPI(mapId);
+
+    // Get the layer
+    const layer = layerApi.getGeoviewLayer(layerPath);
+    if (!layer) throw new LayerNotFoundError(layerPath);
+
+    // Get extent from features calling the GV Layer method
+    return layer.getExtentFromFeatures(objectIds, layerApi.mapViewer.getProjection(), outfield);
   }
 
   static getLayerIconImage(layerLegend: TypeLegend | null): TypeLegendLayerItem[] | undefined {
@@ -226,7 +276,7 @@ export class LegendEventProcessor extends AbstractEventProcessor {
     return undefined;
   }
 
-  /** ***************************************************************************************************************************
+  /**
    * This method propagates the information stored in the legend layer set to the store.
    *
    * @param {string} mapId The map identifier.
@@ -272,8 +322,7 @@ export class LegendEventProcessor extends AbstractEventProcessor {
       const layer = MapEventProcessor.getMapViewerLayerAPI(mapId).getGeoviewLayer(entryLayerPath);
 
       // Interpret the layer name the best we can
-      const layerName =
-        layer?.getLayerName() || layerConfig.layerName || layerConfig.geoviewLayerConfig.geoviewLayerName || layerConfig.layerPath;
+      const layerName = layer?.getLayerName() || layerConfig.getLayerName() || 'no name';
 
       let entryIndex = existingEntries.findIndex((entry) => entry.layerPath === entryLayerPath);
       if (layerEntryIsGroupLayer(layerConfig)) {
@@ -506,6 +555,9 @@ export class LegendEventProcessor extends AbstractEventProcessor {
 
     // TODO Update after refactor, layerEntryConfig will not know initial settings
     const layerEntryConfig = MapEventProcessor.getMapViewerLayerAPI(mapId).getLayerEntryConfig(layerPath);
+
+    // Set the layer status to loading
+    layerEntryConfig?.setLayerStatusLoading();
 
     // If layer is group, refresh child layers
     if (layerEntryConfig && layerEntryIsGroupLayer(layerEntryConfig))

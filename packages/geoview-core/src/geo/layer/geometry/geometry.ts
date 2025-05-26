@@ -16,6 +16,7 @@ import { MapEventProcessor } from '@/api/event-processors/event-processor-childr
 import { logger } from '@/core/utils/logger';
 
 import { TypeFeatureCircleStyle, TypeFeatureStyle, TypeIconStyle } from '@/geo/layer/geometry/geometry-types';
+import { NotSupportedError } from '@/core/exceptions/core-exceptions';
 
 /**
  * Store a group of features
@@ -48,7 +49,7 @@ export class GeometryApi {
   // index of the active geometry group used to add new geometries in the map
   activeGeometryGroupIndex = 0;
 
-  /** used to reference the map viewer */
+  /** Reference on the map viewer */
   mapViewer: MapViewer;
 
   // Keep all callback delegates references
@@ -61,9 +62,6 @@ export class GeometryApi {
   constructor(mapViewer: MapViewer) {
     this.mapViewer = mapViewer;
     this.#mapId = mapViewer.mapId;
-
-    // create default geometry group
-    this.createGeometryGroup(this.defaultGeometryGroupId);
   }
 
   /**
@@ -266,9 +264,11 @@ export class GeometryApi {
 
     const featureId = optionalFeatureId || generateId();
 
+    const projectionConv = Projection.getProjectionFromString(`EPSG:${options?.projection || 4326}`);
+
     const projectedCoordinates = Projection.transform(
       coordinate,
-      `EPSG:${options?.projection || 4326}`,
+      projectionConv,
       Projection.PROJECTIONS[MapEventProcessor.getMapState(this.#mapId).currentProjection]
     );
 
@@ -569,7 +569,7 @@ export class GeometryApi {
     try {
       geometryGroup.vectorLayer.getSource()?.addFeature(geometry as never);
       geometryGroup.vectorLayer.changed();
-    } catch (error) {
+    } catch (error: unknown) {
       logger.logError(`Error adding geometry to group ${geometryGroupId}`, error);
     }
   }
@@ -786,7 +786,8 @@ export class GeometryApi {
 
       // Add support for other geometry types as needed
       default:
-        throw new Error(`Unsupported geometry type: ${geometryType}`);
+        // Unsupported geometry type
+        throw new NotSupportedError(`Unsupported geometry type: ${geometryType}`);
     }
   }
 

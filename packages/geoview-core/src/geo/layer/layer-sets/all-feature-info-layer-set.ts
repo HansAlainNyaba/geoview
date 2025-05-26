@@ -9,7 +9,7 @@ import {
   TypeAllFeatureInfoResultSetEntry,
 } from '@/core/stores/store-interface-and-intial-values/data-table-state';
 import { logger } from '@/core/utils/logger';
-import { AbortError } from '@/core/exceptions/core-exceptions';
+import { RequestAbortedError } from '@/core/exceptions/core-exceptions';
 
 /**
  * A Layer-set working with the LayerApi at handling a result set of registered layers and synchronizing
@@ -133,7 +133,14 @@ export class AllFeatureInfoLayerSet extends AbstractLayerSet {
         this.#abortControllers[layerPath] = new AbortController();
 
         // Process query on results data
-        const promiseResult = AbstractLayerSet.queryLayerFeatures(layer, queryType, layerPath, false, this.#abortControllers[layerPath])
+        const promiseResult = AbstractLayerSet.queryLayerFeatures(
+          this.layerApi.mapViewer.map,
+          layer,
+          queryType,
+          layerPath,
+          false,
+          this.#abortControllers[layerPath]
+        )
           .then((arrayOfRecords) => {
             // Use the response to align arrayOfRecords fields with layerConfig fields
             if (arrayOfRecords.length) {
@@ -149,9 +156,9 @@ export class AllFeatureInfoLayerSet extends AbstractLayerSet {
             // Query was processed
             this.resultSet[layerPath].queryStatus = 'processed';
           })
-          .catch((error) => {
+          .catch((error: unknown) => {
             // If aborted
-            if (AbortError.isAbortError(error)) {
+            if (error instanceof RequestAbortedError) {
               // Log
               logger.logDebug('Query aborted and replaced by another one.. keep spinning..');
             } else {

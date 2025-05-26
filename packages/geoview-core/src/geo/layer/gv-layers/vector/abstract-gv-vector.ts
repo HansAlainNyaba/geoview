@@ -1,26 +1,30 @@
 import BaseLayer from 'ol/layer/Base';
-import { Feature } from 'ol';
+import { Map as OLMap, Feature } from 'ol';
 import { FeatureLike } from 'ol/Feature';
 import { Geometry } from 'ol/geom';
 import VectorLayer from 'ol/layer/Vector';
 import VectorSource from 'ol/source/Vector';
 import { Options as VectorLayerOptions } from 'ol/layer/VectorImage';
-import { GeoJSON as FormatGeoJSON } from 'ol/format';
 import Style from 'ol/style/Style';
 import { Coordinate } from 'ol/coordinate';
 import { Extent } from 'ol/extent';
 import { Pixel } from 'ol/pixel';
-import { ProjectionLike } from 'ol/proj';
+import { Projection as OLProjection } from 'ol/proj';
+import isEqual from 'lodash/isEqual';
 
-import { FilterNodeArrayType, NodeType } from '@/geo/utils/renderer/geoview-renderer-types';
+import { FilterNodeType, NodeType } from '@/geo/utils/renderer/geoview-renderer-types';
 import { logger } from '@/core/utils/logger';
 import { VectorLayerEntryConfig } from '@/core/utils/config/validation-classes/vector-layer-entry-config';
 import { TypeFeatureInfoEntry, TypeOutfieldsType } from '@/api/config/types/map-schema-types';
 import { analyzeLayerFilter, getAndCreateFeatureStyle } from '@/geo/utils/renderer/geoview-renderer';
 import { createAliasLookup, featureInfoGetFieldType, parseDateTimeValuesVector } from '@/geo/layer/gv-layers/utils';
 import { AbstractGVLayer } from '@/geo/layer/gv-layers/abstract-gv-layer';
-import { getExtentUnion } from '@/geo/utils/utilities';
-import { GeoViewError } from '@/core/exceptions/geoview-exceptions';
+import { getExtentUnion, validateExtent } from '@/geo/utils/utilities';
+import { Projection } from '@/geo/utils/projection';
+import { LayerInvalidLayerFilterError } from '@/core/exceptions/layer-exceptions';
+import { NoExtentError } from '@/core/exceptions/geoview-exceptions';
+import { formatError } from '@/core/exceptions/core-exceptions';
+import { TypeDateFragments } from '@/core/utils/date-mgt';
 
 /**
  * Abstract Geoview Layer managing an OpenLayer vector type layer.
@@ -28,12 +32,11 @@ import { GeoViewError } from '@/core/exceptions/geoview-exceptions';
 export abstract class AbstractGVVector extends AbstractGVLayer {
   /**
    * Constructs a GeoView Vector layer to manage an OpenLayer layer.
-   * @param {string} mapId - The map id
    * @param {VectorSource<Feature<Geometry>>} olSource - The OpenLayer source.
    * @param {VectorLayerEntryConfig} layerConfig - The layer configuration.
    */
-  protected constructor(mapId: string, olSource: VectorSource<Feature<Geometry>>, layerConfig: VectorLayerEntryConfig) {
-    super(mapId, olSource, layerConfig);
+  protected constructor(olSource: VectorSource<Feature<Geometry>>, layerConfig: VectorLayerEntryConfig) {
+    super(olSource, layerConfig);
 
     // Get the style label in case we need it later
     const label = layerConfig.layerName || layerConfig.layerId;
@@ -55,6 +58,9 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
 
     // Init the layer options with initial settings
     AbstractGVVector.initOptionsWithInitialSettings(layerOptions, layerConfig);
+
+    // Apply the layer filter right away if any
+    AbstractGVVector.applyViewFilterOnConfig(layerConfig, layerConfig.getExternalFragmentsOrder(), undefined, layerConfig.layerFilter);
 
     // Create and set the OpenLayer layer
     this.olLayer = new VectorLayer<VectorSource<Feature<Geometry>>>(layerOptions);
@@ -108,16 +114,17 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
   ): Promise<TypeFeatureInfoEntry[]> {
     // Get the layer config in a loaded phase
     const layerConfig = this.getLayerConfig();
-    const features = this.getOLSource()!.getFeatures();
+    const features = this.getOLSource().getFeatures();
     return Promise.resolve(this.formatFeatureInfoResult(features, layerConfig));
   }
 
   /**
    * Overrides the return of feature information at a given pixel location.
+   * @param {OLMap} map - The Map where to get Feature Info At Pixel from.
    * @param {Pixel} location - The pixel coordinate that will be used by the query.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
-  protected override getFeatureInfoAtPixel(location: Pixel): Promise<TypeFeatureInfoEntry[]> {
+  protected override getFeatureInfoAtPixel(map: OLMap, location: Pixel): Promise<TypeFeatureInfoEntry[]> {
     // Get the layer source
     const layerSource = this.getOLSource();
 
@@ -129,7 +136,10 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
     };
 
     // Query the map using the layer filter and a hit tolerance
-    const features = this.getMapViewer().map.getFeaturesAtPixel(location, { hitTolerance: this.hitTolerance, layerFilter }) as Feature[];
+    const features = map.getFeaturesAtPixel(location, {
+      hitTolerance: this.getHitTolerance(),
+      layerFilter,
+    }) as Feature[];
 
     // Format and return the features
     return Promise.resolve(this.formatFeatureInfoResult(features, this.getLayerConfig()));
@@ -137,12 +147,14 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
 
   /**
    * Overrides the return of feature information at a given coordinate.
+   * @param {OLMap} map - The Map where to get Feature Info At Coordinate from.
    * @param {Coordinate} location - The coordinate that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
   protected override getFeatureInfoAtCoordinate(
+    map: OLMap,
     location: Coordinate,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     queryGeometry: boolean = true,
@@ -150,17 +162,19 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
     abortController: AbortController | undefined = undefined
   ): Promise<TypeFeatureInfoEntry[]> {
     // Redirect to getFeatureInfoAtPixel
-    return this.getFeatureInfoAtPixel(this.getMapViewer().map.getPixelFromCoordinate(location));
+    return this.getFeatureInfoAtPixel(map, map.getPixelFromCoordinate(location));
   }
 
   /**
    * Overrides the return of feature information at the provided long lat coordinate.
+   * @param {OLMap} map - The Map where to get Feature Info At LongLat from.
    * @param {Coordinate} lnglat - The coordinate that will be used by the query.
    * @param {boolean} queryGeometry - Whether to include geometry in the query, default is true.
    * @param {AbortController?} abortController - The optional abort controller.
    * @returns {Promise<TypeFeatureInfoEntry[]>} A promise of an array of TypeFeatureInfoEntry[].
    */
   protected override getFeatureInfoAtLongLat(
+    map: OLMap,
     lnglat: Coordinate,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     queryGeometry: boolean = true,
@@ -168,70 +182,54 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
     abortController: AbortController | undefined = undefined
   ): Promise<TypeFeatureInfoEntry[]> {
     // Convert Coordinates LngLat to map projection
-    const projCoordinate = this.getMapViewer().convertCoordinateLngLatToMapProj(lnglat);
+    const projCoordinate = Projection.transformFromLonLat(lnglat, map.getView().getProjection());
 
     // Redirect to getFeatureInfoAtPixel
-    return this.getFeatureInfoAtPixel(this.getMapViewer().map.getPixelFromCoordinate(projCoordinate));
+    return this.getFeatureInfoAtPixel(map, map.getPixelFromCoordinate(projCoordinate));
   }
 
   /**
-   * Overrides when the layer gets in loaded status.
+   * Applies a view filter to a Vector layer's configuration by updating the layerConfig.filterEquation parameter.
+   * @param {string | undefined} filter - The raw filter string input (defaults to an empty string if not provided).
    */
-  protected override onLoaded(): void {
-    // Call parent
-    super.onLoaded();
-
-    // Apply view filter immediately
-    this.applyViewFilter(this.getLayerConfig().layerFilter || '');
-  }
-
-  /**
-   * Applies a view filter to the layer. When the combineLegendFilter flag is false, the filter parameter is used alone to display
-   * the features. Otherwise, the legend filter and the filter parameter are combined together to define the view filter. The
-   * legend filters are derived from the uniqueValue or classBreaks style of the layer. When the layer config is invalid, nothing
-   * is done.
-   * @param {string} filter - A filter to be used in place of the getViewFilter value.
-   * @param {boolean} combineLegendFilter - Flag used to combine the legend filter and the filter together (default: true)
-   */
-  applyViewFilter(filter: string, combineLegendFilter: boolean = true): void {
+  applyViewFilter(filter: string | undefined = ''): void {
     // Log
     logger.logTraceCore('ABSTRACT-GV-VECTOR - applyViewFilter', this.getLayerPath());
 
-    const layerConfig = this.getLayerConfig();
-    const olLayer = this.getOLLayer();
-
-    // Update the layer config on the fly (maybe not ideal to do this?)
-    layerConfig.legendFilterIsOff = !combineLegendFilter;
-    if (combineLegendFilter) layerConfig.layerFilter = filter;
-
-    // Parse the filter value to use
-    let filterValueToUse: string = filter.replaceAll(/\s{2,}/g, ' ').trim();
-    filterValueToUse = parseDateTimeValuesVector(filterValueToUse, this.getExternalFragmentsOrder());
-
-    try {
-      const filterEquation = analyzeLayerFilter([{ nodeType: NodeType.unprocessedNode, nodeValue: filterValueToUse }]);
-      layerConfig.filterEquation = filterEquation;
-    } catch (error) {
-      throw new GeoViewError(
-        this.getMapId(),
-        `Invalid vector layer filter (${(error as { message: string }).message}).\nfilter = ${this.getLayerFilter()}\ninternal filter = ${filterValueToUse}`
-      );
-    }
-
-    olLayer.changed();
-
-    // Emit event
-    this.emitLayerFilterApplied({
-      filter: filterValueToUse,
-    });
+    // Redirect
+    AbstractGVVector.applyViewFilterOnConfig(
+      this.getLayerConfig(),
+      this.getExternalFragmentsOrder(),
+      this,
+      filter,
+      (filterToUse: string) => {
+        // Emit event
+        this.emitLayerFilterApplied({
+          filter: filterToUse,
+        });
+      }
+    );
   }
 
   /**
    * Overrides the way to get the bounds for this layer type.
+   * @param {OLProjection} projection - The projection to get the bounds into.
+   * @param {number} stops - The number of stops to use to generate the extent.
    * @returns {Extent | undefined} The layer bounding box.
    */
-  override onGetBounds(): Extent | undefined {
-    const sourceExtent = this.getOLSource().getExtent();
+  override onGetBounds(projection: OLProjection, stops: number): Extent | undefined {
+    // Get the source projection
+    const sourceProjection = this.getOLSource().getProjection();
+
+    // Get the layer bounds
+    let sourceExtent = this.getOLSource()?.getExtent();
+
+    // If both found
+    if (sourceExtent && sourceProjection) {
+      // Transform extent to given projection
+      sourceExtent = Projection.transformExtentFromProj(sourceExtent, sourceProjection, projection, stops);
+      sourceExtent = validateExtent(sourceExtent, projection.getCode());
+    }
 
     // Return the calculated layer bounds
     return sourceExtent;
@@ -240,46 +238,39 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
   /**
    * Gets the extent of an array of features.
    * @param {string[]} objectIds - The uids of the features to calculate the extent from.
-   * @returns {Promise<Extent | undefined>} The extent of the features, if available.
+   * @param {OLProjection} outProjection - The output projection for the extent.
+   * @param {string?} outfield - ID field to return for services that require a value in outfields.
+   * @returns {Promise<Extent>} The extent of the features, if available.
    */
-  override getExtentFromFeatures(objectIds: string[]): Promise<Extent | undefined> {
-    // Get array of features
-    const requestedFeatures = objectIds.map((id) => this.getOLLayer().getSource()?.getFeatureById(id));
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  override getExtentFromFeatures(objectIds: string[], outProjection: OLProjection, outfield?: string): Promise<Extent> {
+    // Get the feature source
+    const source = this.getOLLayer().getSource();
 
-    if (requestedFeatures) {
-      // Determine max extent from features
-      let calculatedExtent: Extent | undefined;
-      requestedFeatures.forEach((feature) => {
-        if ((feature as unknown as Feature)?.getGeometry()) {
-          const extent = (feature as unknown as Feature).getGeometry()?.getExtent();
-          if (extent) {
-            // If calculatedExtent has not been defined, set it to extent
-            if (!calculatedExtent) calculatedExtent = extent;
-            else getExtentUnion(calculatedExtent, extent);
-          }
+    // Get array of features and only keep the ones we could find by id
+    const requestedFeatures = objectIds.map((id) => source?.getFeatureById(id)).filter((feature) => !!feature);
+
+    // Determine max extent from features
+    let calculatedExtent: Extent | undefined;
+    requestedFeatures.forEach((feature) => {
+      // Get the geometry
+      const geom = feature.getGeometry();
+      if (geom) {
+        // Get the extent
+        const extent = geom.getExtent();
+        if (extent) {
+          // If calculatedExtent has not been defined, set it to extent
+          if (!calculatedExtent) calculatedExtent = extent;
+          else getExtentUnion(calculatedExtent, extent);
         }
-      });
-
-      return Promise.resolve(calculatedExtent);
-    }
-    return Promise.resolve(undefined);
-  }
-
-  /**
-   * Return the vector layer as a GeoJSON object
-   * @returns {JSON} Layer's features as GeoJSON
-   */
-  getFeaturesAsGeoJSON(): JSON {
-    // Get map projection
-    const mapProjection: ProjectionLike = this.getMapViewer().getProjection().getCode();
-
-    const format = new FormatGeoJSON();
-    const geoJsonStr = format.writeFeatures((this.getOLLayer() as VectorLayer<VectorSource>).getSource()!.getFeatures(), {
-      dataProjection: 'EPSG:4326', // Output projection,
-      featureProjection: mapProjection,
+      }
     });
 
-    return JSON.parse(geoJsonStr);
+    // If no calculated extent
+    if (!calculatedExtent) throw new NoExtentError(this.getLayerPath());
+
+    // Resolve
+    return Promise.resolve(calculatedExtent);
   }
 
   /**
@@ -287,7 +278,7 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
    * @param {AbstractGVLayer} layer - The layer on which to work for the style.
    * @param {FeatureLike} feature - Feature that need its style to be defined.
    * @param {string} label - The style label when one has to be created
-   * @param {FilterNodeArrayType} filterEquation - Filter equation associated to the layer.
+   * @param {FilterNodeType[]} filterEquation - Filter equation associated to the layer.
    * @param {boolean} legendFilterIsOff - When true, do not apply legend filter.
    * @returns {Style} The style for the feature
    */
@@ -295,7 +286,7 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
     layer: AbstractGVLayer,
     feature: FeatureLike,
     label: string,
-    filterEquation?: FilterNodeArrayType,
+    filterEquation?: FilterNodeType[],
     legendFilterIsOff?: boolean
   ): Style | undefined {
     // Get the style
@@ -315,5 +306,81 @@ export abstract class AbstractGVVector extends AbstractGVLayer {
         [geometryType]: { type: 'simple', hasDefault: false, fields: [], info: [theStyle] },
       });
     });
+  }
+
+  /**
+   * Applies a view filter to a vector layer configuration. The resulting filter is parsed and stored in the layer
+   * config's `filterEquation`, and triggers a re-evaluation of feature styles if applicable.
+   * If the layer config is invalid or the filter has not changed, no action is taken. Date values in the filter are also
+   * parsed using external fragments if available.
+   * @param {VectorLayerEntryConfig} layerConfig - The vector layer configuration to apply the filter to.
+   * @param {TypeDateFragments | undefined} externalDateFragments - Optional date fragments used to parse time-based filters.
+   * @param {AbstractGVLayer | undefined} layer - Optional GeoView layer containing that will get its source updated to trigger a redraw.
+   * @param {string | undefined} filter - A raw filter string to override the layer's view filter (default is an empty string).
+   * @param {(filterToUse: string) => void} [callbackWhenUpdated] - Optional callback invoked with the final filter string if updated.
+   * @throws {LayerInvalidLayerFilterError} If the filter cannot be parsed or applied due to a syntax or runtime issue.
+   */
+  static applyViewFilterOnConfig(
+    layerConfig: VectorLayerEntryConfig,
+    externalDateFragments: TypeDateFragments | undefined,
+    layer: AbstractGVLayer | undefined,
+    filter: string | undefined = '',
+    callbackWhenUpdated: ((filterToUse: string) => void) | undefined = undefined
+  ): void {
+    // Update the layer config on the fly (maybe not ideal to do this?)
+    // eslint-disable-next-line no-param-reassign
+    layerConfig.legendFilterIsOff = false;
+    // eslint-disable-next-line no-param-reassign
+    layerConfig.layerFilter = filter;
+
+    // Get the current filter
+    const currentFilter = layerConfig.filterEquation;
+
+    // Parse the filter value to use
+    let filterValueToUse: string = filter.replaceAll(/\s{2,}/g, ' ').trim();
+
+    try {
+      // Parse is some more for the dates
+      filterValueToUse = parseDateTimeValuesVector(filterValueToUse, externalDateFragments);
+
+      // Analyze the layer filter
+      const filterEquation = analyzeLayerFilter([{ nodeType: NodeType.unprocessedNode, nodeValue: filterValueToUse }]);
+
+      // Define what is considered the default filter
+      const isDefaultFilter = !filterValueToUse;
+
+      // Define what is a no operation
+      const isNewFilterEffectivelyNoop = isDefaultFilter && !currentFilter;
+
+      // Check whether the current filter is different from the new one
+      const filterChanged = !isEqual(layerConfig.filterEquation, filterEquation);
+
+      // Determine if we should apply or reset filter
+      const shouldUpdateFilter = (filterChanged && !isNewFilterEffectivelyNoop) || (!!currentFilter && isDefaultFilter);
+
+      // If should update the filtering
+      if (shouldUpdateFilter) {
+        // Update the filter equation
+        // eslint-disable-next-line no-param-reassign
+        layerConfig.filterEquation = filterEquation;
+
+        // Flag about the change.
+        // GV This will force a callback on the source style callback, which for us is the 'calculateStyleForFeature' function and
+        // GV since we've changed the filterEquation, the style will be recreated using that filterEquation.
+        layer?.getOLLayer().changed();
+
+        // Callback
+        callbackWhenUpdated?.(filterValueToUse);
+      }
+    } catch (error: unknown) {
+      // Failed
+      throw new LayerInvalidLayerFilterError(
+        layerConfig.layerPath,
+        layerConfig.getLayerName(),
+        filterValueToUse,
+        currentFilter?.join(','),
+        formatError(error)
+      );
+    }
   }
 }

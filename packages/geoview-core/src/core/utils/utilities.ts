@@ -2,20 +2,20 @@ import { Root, createRoot } from 'react-dom/client';
 import sanitizeHtml from 'sanitize-html';
 
 import { TypeDisplayLanguage } from '@/api/config/types/map-schema-types';
-import { Cast, TypeJsonArray, TypeJsonObject, TypeJsonValue } from '@/api/config/types/config-types';
+import { Cast, TypeJsonObject } from '@/api/config/types/config-types';
 import { logger } from '@/core/utils/logger';
 import i18n from '@/core/translation/i18n';
 import { TypeGuideObject } from '@/core/stores/store-interface-and-intial-values/app-state';
-import { EmptyResponseError } from '@/core/exceptions/core-exceptions';
+import { Fetch } from '@/core/utils/fetch-helper';
 
 /**
  * Take string like "My string is __param__" and replace parameters (__param__) from array of values
  *
- * @param {TypeJsonValue[] | TypeJsonArray | string[]} params - An array of parameters to replace, i.e. ['short']
+ * @param {unknown[]} params - An array of parameters to replace, i.e. ['short']
  * @param {string} message - The original message, i.e. "My string is __param__"
  * @returns {string} Message with values replaced "My string is short"
  */
-export function replaceParams(params: TypeJsonValue[] | TypeJsonArray | string[], message: string): string {
+export function replaceParams(params: unknown[], message: string): string {
   let tmpMess = message;
   (params as string[]).forEach((item: string) => {
     tmpMess = tmpMess.replace('__param__', item);
@@ -27,17 +27,20 @@ export function replaceParams(params: TypeJsonValue[] | TypeJsonArray | string[]
 /**
  * Return proper language Geoview localized values from map i18n instance
  *
- * @param {string} localizedKey - The localize key to read the message from
  * @param {TypeDisplayLanguage} language - The language to get the message in
+ * @param {string} messageKey - The localize key to read the message from
+ * @param {unknown[] | undefined} params - An array of parameters to replace, i.e. ['short']
  * @returns {string} The translated message with values replaced
  */
-export function getLocalizedMessage(
-  localizedKey: string,
-  language: TypeDisplayLanguage,
-  params: TypeJsonValue[] | TypeJsonArray | string[] | undefined = undefined
-): string {
+export function getLocalizedMessage(language: TypeDisplayLanguage, messageKey: string, params: unknown[] | undefined = undefined): string {
+  // Check if the message key exists, before translating it and log a warning when it doesn't exist
+  if (!i18n.exists(messageKey, { lng: language })) {
+    // Log error
+    logger.logError(`MISSING MESSAGE KEY FOR MESSAGE: ${messageKey}`);
+  }
+
   const trans = i18n.getFixedT(language);
-  let message = trans(localizedKey);
+  let message = trans(messageKey);
 
   // if params provided, replace them
   if (params && params.length > 0) message = replaceParams(params, message);
@@ -107,10 +110,8 @@ export function generateId(length: 8 | 18 | 36 = 36): string {
 
 // TODO: refactor - This is a duplicate of static config api function. Replace in api OR create utilities api functions
 /**
- * Function used to validate the GeoCore UUIDs.
- *
+ * Validates the GeoCore UUIDs.
  * @param {string} uuid The UUID to validate.
- *
  * @returns {boolean} Returns true if the UUID respect the format.
  */
 export function isValidUUID(uuid: string): boolean {
@@ -132,7 +133,7 @@ export function setAlphaColor(colorArray: number[], alpha: number): number[] {
 }
 
 /**
- * Validate if a JSON string is well formatted
+ * Validates if a JSON string is well formatted
  * @param {string} str - The string to test
  * @returns {bollean} true if the JSON is valid, false otherwise
  */
@@ -157,14 +158,15 @@ export function isJsonString(str: string): boolean {
 }
 
 /**
- * Convert an XML document object into a json object
- *
+ * Converts an XML document object into a json object
  * @param {Document | Node | Element} xml - The XML document object
  * @returns The converted json object
  */
-export function xmlToJson(xml: Document | Node | Element): TypeJsonObject {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function xmlToJson(xml: Document | Node | Element): any {
   // Create the return object
-  let obj: TypeJsonObject | TypeJsonValue = {};
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let obj: any = {};
 
   // check for node type if it's an element, attribute, text, comment...
   if (xml.nodeType === 1) {
@@ -181,7 +183,7 @@ export function xmlToJson(xml: Document | Node | Element): TypeJsonObject {
     }
   } else if (xml.nodeType === 3) {
     // text
-    (obj as TypeJsonValue) = xml.nodeValue;
+    obj = xml.nodeValue;
   }
 
   // do children
@@ -189,14 +191,13 @@ export function xmlToJson(xml: Document | Node | Element): TypeJsonObject {
     for (let i = 0; i < xml.childNodes.length; i++) {
       const item = xml.childNodes.item(i);
       const { nodeName } = item;
-      const jsonObject = obj;
-      if (jsonObject[nodeName] === undefined) {
-        jsonObject[nodeName] = xmlToJson(item);
+      if (obj[nodeName] === undefined) {
+        obj[nodeName] = xmlToJson(item);
       } else {
-        if (jsonObject[nodeName].push === undefined) {
-          (jsonObject[nodeName] as TypeJsonArray) = [jsonObject[nodeName]];
+        if (obj[nodeName].push === undefined) {
+          obj[nodeName] = [obj[nodeName]];
         }
-        (jsonObject[nodeName] as TypeJsonArray).push(xmlToJson(item));
+        obj[nodeName].push(xmlToJson(item));
       }
     }
   }
@@ -205,62 +206,11 @@ export function xmlToJson(xml: Document | Node | Element): TypeJsonObject {
 }
 
 /**
- * Fetches a url for a json response.
- * If the response is empty, throws an EmptyResponseError.
- * @param {string} url - The url to fetch.
- * @returns {Promise<TypeJsonObject>} The fetched json response.
- */
-export async function fetchJson(url: string): Promise<TypeJsonObject> {
-  // Query and read
-  const response = await fetch(url);
-  const responseJson = await response.json();
-
-  // Check if the response is an empty object
-  if (responseJson.constructor === Object && Object.keys(responseJson).length >= 0) {
-    // Return the value
-    return responseJson;
-  }
-
-  // Throw empty response error
-  throw new EmptyResponseError();
-}
-
-/**
- * Fetches a url for a xml response then converts the response to a json response.
- * If the response is empty, throws an EmptyResponseError.
- * @param {string} url - The url to fetch.
- * @returns {Promise<TypeJsonObject>} The fetched json response.
- */
-export async function fetchXMLToJson(url: string): Promise<TypeJsonObject> {
-  // Query and read
-  const response = await fetch(url);
-  const responseText = await response.text();
-
-  // If responded
-  if (responseText.trim() !== '') {
-    // Parse the text/xml to DOM
-    const xmlDOMCapabilities = new DOMParser().parseFromString(responseText, 'text/xml');
-
-    // Parse it using xmlToJson
-    const responseJson = xmlToJson(xmlDOMCapabilities);
-
-    // Check if the response is an empty object
-    if (responseJson.constructor === Object && Object.keys(responseJson).length >= 0) {
-      // Return the value
-      return responseJson;
-    }
-  }
-
-  // Throw empty response error
-  throw new EmptyResponseError();
-}
-
-/**
  * Execute a XMLHttpRequest
  * @param {string} url - The url to request
  * @returns {Promise<string>} The return value, return is '{}' if request failed
+ * @deprecated Use the core/utils/fetch-helper.ts/Fetch functions instead
  */
-// TODO: Obsolete - This is a very old way of making a query
 export function getXMLHttpRequest(url: string): Promise<string> {
   const request = new Promise<string>((resolve) => {
     try {
@@ -277,7 +227,7 @@ export function getXMLHttpRequest(url: string): Promise<string> {
         resolve('{}');
       };
       jsonObj.send(null);
-    } catch (error) {
+    } catch (error: unknown) {
       // Log warning
       logger.logWarning(error);
       resolve('{}');
@@ -361,7 +311,7 @@ export function exportPNG(dataUrl: string, name: string): void {
     element.setAttribute('href', dataUrl);
     element.setAttribute('download', filename);
     element.click();
-  } catch (error) {
+  } catch (error: unknown) {
     logger.logError(`Error trying to export PNG.`, error);
   }
 }
@@ -414,6 +364,70 @@ export function stringify(str: unknown): unknown | string {
 }
 
 /**
+ * Delay helper function.
+ * @param {number} ms - The number of milliseconds to wait for.
+ * @returns {Promise<void>} Promise which resolves when the delay timeout expires.
+ */
+export const delay = (ms: number): Promise<void> => {
+  return new Promise((resolve) => {
+    // Wait
+    setTimeout(resolve, ms);
+  });
+};
+
+/**
+ * Repeatedly invokes a callback function at a given interval until it returns `true`.
+ * Once the callback returns `true`, the interval is cleared and the polling stops.
+ * @param {() => T} callback - A function that is called every `ms` milliseconds.
+ *                                   If it returns `true`, the interval is cleared.
+ * @param {number} ms - The interval time in milliseconds between callback executions.
+ * @returns {NodeJS.Timeout} The interval timer ID, which can be used to clear the interval manually if needed.
+ */
+export const doUntil = <T>(callback: () => T, ms: number): NodeJS.Timeout => {
+  // Start a recurrent timer
+  let done = false;
+  const interval = setInterval(() => {
+    // If done, skip (protect against race conditions)
+    if (done) return;
+
+    // Callback
+    const shouldStop = callback();
+
+    // If clearing the interval
+    if (shouldStop) {
+      done = true;
+      clearInterval(interval);
+    }
+  }, ms);
+
+  // Return the interval timer
+  return interval;
+};
+
+/**
+ * Repeatedly invokes a callback function at a specified interval until one of two conditions is met:
+ * - The callback function explicitly returns `true`, indicating the interval should be cleared.
+ * - All provided promises have resolved or rejected.
+ * This is useful for performing a recurring action (e.g., logging or polling) that can end either due to
+ * external completion logic or once all promises are settled.
+ * @param {() => T} callback - A function executed on each interval. If it returns `true`, the interval is cleared.
+ * @param {Promise<unknown>[]} promises - An array of promises whose completion will also stop the interval.
+ * @param {number} ms - The interval duration in milliseconds.
+ * @returns {NodeJS.Timeout} The interval timer, which can be cleared manually if needed.
+ */
+export const doUntilPromises = <T>(callback: () => T, promises: Promise<unknown>[], ms: number): NodeJS.Timeout => {
+  // Start a recurrent timer
+  const interval = doUntil(callback, ms);
+
+  // Disble eslint here, it should be caught by the creator of the promise
+  // eslint-disable-next-line @typescript-eslint/no-floating-promises
+  Promise.all(promises).finally(() => clearInterval(interval));
+
+  // Return the interval timer
+  return interval;
+};
+
+/**
  * Internal function to work with async "whenThisThat"... methods.
  * This function is recursive and checks for a validity of something via the checkCallback() until it's found or until the timer runs out.
  * When the check callback returns true (or some found object), the doCallback() function is called with the found information.
@@ -423,7 +437,7 @@ export function stringify(str: unknown): unknown | string {
  * @param {function} failCallback - The function executed when checkCallback has failed for too long (went over the timeout)
  * @param {Date} startDate - The initial date this task was started
  * @param {number} timeout - The duration in milliseconds until the task is aborted
- * @param {number} checkFrequency - The frequency in milliseconds to callback for a check (defaults to 100 milliseconds)
+ * @param {number} checkFrequency - The frequency in milliseconds to callback for a check.
  */
 // eslint-disable-next-line no-underscore-dangle
 function _whenThisThenThat<T>(
@@ -434,21 +448,31 @@ function _whenThisThenThat<T>(
   timeout: number,
   checkFrequency: number
 ): void {
+  // GV This pattern immediately calls the callback and then starts checking recursively.
+  // Do not change this for a 'doUntil' as the latter only calls the callback *after* the first checkFrequency expires.
+
   // Check if we're good
   const v = checkCallback();
+
+  // If check was positive
   if (v) {
-    // Do that
+    // Do that and we're done
     doCallback(v);
-  } else if (new Date().getTime() - startDate.getTime() <= timeout) {
-    // Check again later
-    setTimeout(() => {
-      // Recursive call
-      _whenThisThenThat(checkCallback, doCallback, failCallback, startDate, timeout, checkFrequency);
-    }, checkFrequency);
-  } else {
-    // Failed, took too long, this throws an exception in typical async/await contexts
-    failCallback('Task abandonned, took too long.');
+    return;
   }
+
+  // If expired
+  if (Date.now() - startDate.getTime() > timeout) {
+    // Failed, took too long, this throws an exception in typical async/await contexts
+    failCallback(`Task abandonned, took over ${timeout} ms to get anything.`);
+    return;
+  }
+
+  // Check again later
+  setTimeout(() => {
+    // Recursive call
+    _whenThisThenThat(checkCallback, doCallback, failCallback, startDate, timeout, checkFrequency);
+  }, checkFrequency);
 }
 
 /**
@@ -487,24 +511,49 @@ export function whenThisThen<T>(checkCallback: () => T, timeout?: number, checkF
 }
 
 /**
- * Delay helper function.
- * @param {number} ms - The number of milliseconds to wait for.
- * @returns {Promise<void>} Promise which resolves when the delay timeout expires.
- */
-export const delay = (ms: number): Promise<void> => {
-  return new Promise((resolve) => {
-    // Wait
-    setTimeout(resolve, ms);
-  });
-};
-
-/**
  * Escape special characters from string
  * @param {string} text - The text to escape
  * @returns {string} Espaced string
  */
 export function escapeRegExp(text: string): string {
   return text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+}
+
+/**
+ * Tries to read an ArrayBuffer into a string by guessing different encodings and returning the best that works to read the content.
+ * @param {ArrayBuffer} buffer - The array buffer to read from.
+ * @param {string[]} encodings - The encodings to try, defaults to ['utf-8', 'windows-1252', 'iso-8859-1'].
+ * @returns { text: string; encoding: string } The best text and the best encoding used for the text
+ */
+export function readTextWithBestEncoding(
+  buffer: ArrayBuffer,
+  encodings: string[] = ['utf-8', 'windows-1252', 'iso-8859-1']
+): { text: string; encoding: string } {
+  const uint8View = new Uint8Array(buffer);
+  let fallback: { text: string; encoding: string } | null = null;
+
+  // For each encoding to try
+  for (const encoding of encodings) {
+    try {
+      const decoder = new TextDecoder(encoding, { fatal: false });
+      const text = decoder.decode(uint8View);
+
+      // If no replacement characters are present, it's a clean decode
+      if (!text.includes('\uFFFD')) {
+        return { text, encoding };
+      }
+
+      // Save the first partially-decodable fallback
+      if (!fallback) {
+        fallback = { text, encoding };
+      }
+    } catch {
+      // Ignore decode errors
+    }
+  }
+
+  // If none are clean, return the first partially-decodable fallback
+  return fallback ?? { text: '', encoding: '' };
 }
 
 /**
@@ -529,8 +578,8 @@ export async function createGuideObject(
   assetsURL: string
 ): Promise<TypeGuideObject | undefined> {
   try {
-    const response = await fetch(`${assetsURL}/locales/${language}/guide.md`);
-    const content = await response.text();
+    // Fetch the guide content
+    const content = await Fetch.fetchText(`${assetsURL}/locales/${language}/guide.md`);
 
     // Split by first level sections (Split with =1!<key>=) AND set URL for images from the assetURL
     const sections = content.replaceAll('{{assetsURL}}', assetsURL).split(/=(?=1!)(.*?)=/);
@@ -587,7 +636,7 @@ export async function createGuideObject(
       guideObject[key] = { heading, content: sectionContent, children };
     }
     return guideObject;
-  } catch (error) {
+  } catch (error: unknown) {
     logger.logError(mapId, error, 'createGuideObject');
     return undefined;
   }

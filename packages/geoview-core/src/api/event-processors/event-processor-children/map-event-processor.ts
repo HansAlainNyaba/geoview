@@ -25,14 +25,14 @@ import {
   TypeLayerEntryConfig,
   TypeMapConfig,
   TypeMapFeaturesInstance,
+  CONST_LAYER_TYPES,
 } from '@/api/config/types/map-schema-types';
 import { api } from '@/app';
 import { LayerApi } from '@/geo/layer/layer';
 import { MapViewer, TypeMapState, TypeMapMouseInfo } from '@/geo/map/map-viewer';
 import { TypeRecordOfPlugin } from '@/api/plugin/plugin-types';
-import { CONST_LAYER_TYPES } from '@/geo/layer/geoview-layers/abstract-geoview-layers';
 import { Projection } from '@/geo/utils/projection';
-import { isPointInExtent } from '@/geo/utils/utilities';
+import { isPointInExtent, isExtentLngLat } from '@/geo/utils/utilities';
 import { getGeoViewStore } from '@/core/stores/stores-managers';
 import { NORTH_POLE_POSITION, OL_ZOOM_DURATION, OL_ZOOM_MAXZOOM, OL_ZOOM_PADDING } from '@/core/utils/constant';
 import { logger } from '@/core/utils/logger';
@@ -58,8 +58,9 @@ import { GVEsriImage } from '@/geo/layer/gv-layers/raster/gv-esri-image';
 import { AbstractGVVector } from '@/geo/layer/gv-layers/vector/abstract-gv-vector';
 import { GVEsriDynamic } from '@/geo/layer/gv-layers/raster/gv-esri-dynamic';
 import { AbstractGVLayer } from '@/geo/layer/gv-layers/abstract-gv-layer';
-import { GeoViewError } from '@/core/exceptions/geoview-exceptions';
+import { InvalidExtentError } from '@/core/exceptions/geoview-exceptions';
 import { AbstractGVVectorTile } from '@/geo/layer/gv-layers/vector/abstract-gv-vector-tile';
+import { NotSupportedError } from '@/core/exceptions/core-exceptions';
 
 // GV The paradigm when working with MapEventProcessor vs MapState goes like this:
 // GV MapState provides: 'state values', 'actions' and 'setterActions'.
@@ -105,13 +106,13 @@ export class MapEventProcessor extends AbstractEventProcessor {
     map.addControl(scaleBarMetric);
     map.addControl(scaleBarImperial);
 
+    // Get the projection
+    const mapProjection = Projection.getProjectionFromString(`EPSG:${store.getState().mapState.currentProjection}`);
+
     // add map overlays
     // create overlay for north pole icon
     const northPoleId = `${mapId}-northpole`;
-    const projectionPosition = Projection.transformFromLonLat(
-      [NORTH_POLE_POSITION[1], NORTH_POLE_POSITION[0]],
-      `EPSG:${store.getState().mapState.currentProjection}`
-    );
+    const projectionPosition = Projection.transformFromLonLat([NORTH_POLE_POSITION[1], NORTH_POLE_POSITION[0]], mapProjection);
 
     const northPoleMarker = new Overlay({
       id: northPoleId,
@@ -137,6 +138,23 @@ export class MapEventProcessor extends AbstractEventProcessor {
     // Save in the store
     store.getState().mapState.setterActions.setOverlayNorthMarker(northPoleMarker);
     store.getState().mapState.setterActions.setOverlayClickMarker(clickMarkerOverlay);
+
+    // Get the size as [number, number]
+    const size = map.getSize() as unknown as [number, number];
+
+    // Set map size
+    store.getState().mapState.setterActions.setMapSize(size);
+
+    // Get the scale information
+    this.getScaleInfoFromDomElement(mapId)
+      .then((scale) => {
+        // Set the map scale
+        MapEventProcessor.setMapScale(mapId, scale);
+      })
+      .catch((error: unknown) => {
+        // Log error
+        logger.logPromiseFailed('in getScaleInfoFromDomElement in initMapControls', error);
+      });
 
     // set map interaction
     this.setInteraction(mapId, store.getState().mapState.interaction);
@@ -190,7 +208,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
       // TODO: if you run the code fast enough (only happened to me in the TimeSliderEventProcessor),
       // TO.DOCONT: the getMapViewer should be async, because it can be unset as well ( so not just getMapViewerPlugins() ).
       await whenThisThen(() => api && api.hasMapViewer(mapId) && api.getMapViewer(mapId).plugins);
-    } catch (error) {
+    } catch (error: unknown) {
       // Log
       logger.logError(`Couldn't retrieve the plugins instance on Map Viewer`, error);
     }
@@ -204,19 +222,12 @@ export class MapEventProcessor extends AbstractEventProcessor {
    * @returns {Promise<TypeScaleInfo>} A Promise to receive scale information when the dom has it
    */
   static async getScaleInfoFromDomElement(mapId: string): Promise<TypeScaleInfo> {
-    try {
-      // Check if the scaleControl exists and is showing information, wait for it
-      await whenThisThen(
-        () =>
-          document.getElementById(`${mapId}-scaleControlBarMetric`)?.querySelector('.ol-scale-text') &&
-          document.getElementById(`${mapId}-scaleControlBarImperial`)?.querySelector('.ol-scale-text')
-      );
-    } catch (error) {
-      // Log
-      logger.logError(`Couldn't retrieve the scale information from the dom tree`, error);
-      // TODO: Check - Maybe we want to actually throw the exception here? Logging only for now until couple maps get tested.
-      // throw error;
-    }
+    // Check if the scaleControl exists and is showing information, wait for it
+    await whenThisThen(
+      () =>
+        document.getElementById(`${mapId}-scaleControlBarMetric`)?.querySelector('.ol-scale-text') &&
+        document.getElementById(`${mapId}-scaleControlBarImperial`)?.querySelector('.ol-scale-text')
+    );
 
     // Get metric values
     const scaleControlBarMetric = document.getElementById(`${mapId}-scaleControlBarMetric`);
@@ -396,9 +407,14 @@ export class MapEventProcessor extends AbstractEventProcessor {
     this.getMapStateProtected(mapId).setterActions.setRotation(rotation);
   }
 
-  static setMapChangeSize(mapId: string, size: [number, number], scale: TypeScaleInfo): void {
+  static setMapSize(mapId: string, size: [number, number]): void {
     // Save in store
-    this.getMapStateProtected(mapId).setterActions.setMapChangeSize(size, scale);
+    this.getMapStateProtected(mapId).setterActions.setMapSize(size);
+  }
+
+  static setMapScale(mapId: string, scale: TypeScaleInfo): void {
+    // Save in store
+    this.getMapStateProtected(mapId).setterActions.setMapScale(scale);
   }
 
   static setMapMoveEnd(
@@ -446,10 +462,14 @@ export class MapEventProcessor extends AbstractEventProcessor {
       ];
       const newProjection = projectionCode as TypeValidMapProjectionCodes;
 
-      // If maxExtent was provided, apply
+      // If maxExtent was provided and native projection, apply
       // GV The extent is different between LCC and WM and switching from one to the other may introduce weird constraint.
       // GV We may have to keep extent as array for configuration file but, technically, user does not change projection often.
-      const mapMaxExtent = this.getGeoViewMapConfig(mapId)?.map.viewSettings.maxExtent ? CV_MAP_EXTENTS[newProjection] : undefined;
+      // GV A wider LCC extent like [-125, 30, -60, 89] (minus -125) will introduce distortion on larger screen...
+      // GV It is why we apply the max extent only on native projection
+      const viewSettings = this.getGeoViewMapConfig(mapId)?.map.viewSettings;
+      const mapMaxExtent =
+        viewSettings!.maxExtent && newProjection === viewSettings!.projection ? CV_MAP_EXTENTS[newProjection] : undefined;
 
       // create new view settings
       const newView: TypeViewSettings = {
@@ -481,11 +501,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
           this.getMapViewerLayerAPI(mapId).removeLayerUsingPath(layer.getLayerPath());
 
           // Log
-          this.getMapViewer(mapId).notifications.showWarning(
-            `The vector tile ${layer.getLayerName()} had to be removed due to a projection conflict.`,
-            [],
-            true
-          );
+          this.getMapViewer(mapId).notifications.showWarning('warning.layer.vectorTileRemoved', [layer.getLayerName()], true);
         });
 
       // set new view
@@ -500,6 +516,12 @@ export class MapEventProcessor extends AbstractEventProcessor {
       // When the map projection is changed, all layer bounds must be recalculated
       this.getMapViewer(mapId).layer.recalculateBoundsAll();
 
+      // Remove layer higlight if present to avoid bad reprojection
+      const highlightName = LegendEventProcessor.getLayerPanelState(mapId, 'highlightedLayer') as string;
+      if (highlightName !== '') {
+        MapEventProcessor.changeOrRemoveLayerHighlight(mapId, highlightName, highlightName);
+      }
+
       // Reset the map object of overview map control
       MapEventProcessor.setOverviewMapVisibility(mapId, true);
     } finally {
@@ -508,6 +530,11 @@ export class MapEventProcessor extends AbstractEventProcessor {
     }
   }
 
+  /**
+   * Sets the home view
+   * @param mapId - The map id
+   * @param view - The view settings
+   */
   static setHomeButtonView(mapId: string, view: TypeMapViewSettings): void {
     // Save in store
     this.getMapStateProtected(mapId).setterActions.setHomeView(view);
@@ -568,6 +595,30 @@ export class MapEventProcessor extends AbstractEventProcessor {
     const info = this.getMapStateProtected(mapId).orderedLayerInfo;
     for (let i = 0; i < info.length; i++) if (info[i].layerPath === layerPath) return i;
     return -1;
+  }
+
+  static getLegendCollapsibleLayers(mapId: string): TypeOrderedLayerInfo[] {
+    // Get collapsible layers
+    const orderedLayerInfo = this.getMapOrderedLayerInfo(mapId);
+    const { legendLayers } = this.getState(mapId).layerState;
+
+    return orderedLayerInfo.filter((layer) => {
+      const legendLayer = LegendEventProcessor.findLayerByPath(legendLayers, layer.layerPath);
+      return (
+        (legendLayer?.children && legendLayer.children.length > 0) ||
+        (legendLayer?.items && legendLayer.items.length > 1) ||
+        (legendLayer?.type === CONST_LAYER_TYPES.WMS && legendLayer?.icons?.some((icon) => icon.iconImage && icon.iconImage !== 'no data'))
+      );
+    });
+  }
+
+  static getAllLegendLayersCollapsed(mapId: string): boolean {
+    // Get whether all the collapsible layers are collapsed
+    const collapsibleLayers = MapEventProcessor.getLegendCollapsibleLayers(mapId);
+
+    // If there are no collapsible layers, return true
+    if (collapsibleLayers.length === 0) return true;
+    return collapsibleLayers.every((layer) => layer.legendCollapsed);
   }
 
   static getMapLegendCollapsedFromOrderedLayerInfo(mapId: string, layerPath: string): boolean {
@@ -644,7 +695,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
     // Set the group markers, and update on the map
     curMarkers[group] = groupMarkers;
     this.getMapStateProtected(mapId).setterActions.setPointMarkers(curMarkers);
-    MapEventProcessor.getMapViewerLayerAPI(mapId).featureHighlight.pointMarkers.updatePointMarkers(curMarkers);
+    MapEventProcessor.getMapViewerLayerAPI(mapId).featureHighlight.pointMarkers?.updatePointMarkers(curMarkers);
   }
 
   /**
@@ -674,7 +725,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
 
     // Set the pointMarkers and update on map
     this.getMapStateProtected(mapId).setterActions.setPointMarkers(curMarkers);
-    MapEventProcessor.getMapViewerLayerAPI(mapId).featureHighlight.pointMarkers.updatePointMarkers(curMarkers);
+    MapEventProcessor.getMapViewerLayerAPI(mapId).featureHighlight.pointMarkers?.updatePointMarkers(curMarkers);
   }
 
   /**
@@ -687,6 +738,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
   static changeOrRemoveLayerHighlight(mapId: string, layerPath: string, highlightedLayerPath: string): string {
     // If layer is currently highlighted layer, remove highlight
     if (highlightedLayerPath === layerPath) {
+      LegendEventProcessor.setHighlightLayer(mapId, '');
       MapEventProcessor.getMapViewerLayerAPI(mapId).removeHighlightLayer();
       return '';
     }
@@ -732,9 +784,29 @@ export class MapEventProcessor extends AbstractEventProcessor {
     this.getMapStateProtected(mapId).setterActions.setLegendCollapsed(layerPath, collapsed);
   }
 
+  static setAllMapLayerCollapsed(mapId: string, newCollapsed: boolean): void {
+    // Set the collapsed state for all layers
+    const orderedLayerInfo = MapEventProcessor.getMapOrderedLayerInfo(mapId);
+    orderedLayerInfo.forEach((layer) => {
+      if (layer.legendCollapsed !== newCollapsed) {
+        this.setMapLegendCollapsed(mapId, layer.layerPath, newCollapsed);
+      }
+    });
+  }
+
   static setOrToggleMapLayerVisibility(mapId: string, layerPath: string, newValue?: boolean): boolean {
     // Redirect to layerAPI
     return this.getMapViewerLayerAPI(mapId).setOrToggleLayerVisibility(layerPath, newValue);
+  }
+
+  static setAllMapLayerVisibility(mapId: string, newVisibility: boolean): void {
+    // Set the visibility for all layers
+    const layerApi = this.getMapViewerLayerAPI(mapId);
+    layerApi.getGeoviewLayers().forEach((layer) => {
+      if (layer.getVisible() !== newVisibility) {
+        layerApi.setOrToggleLayerVisibility(layer.getLayerPath(), newVisibility);
+      }
+    });
   }
 
   static reorderLayer(mapId: string, layerPath: string, move: number): void {
@@ -851,12 +923,13 @@ export class MapEventProcessor extends AbstractEventProcessor {
     // Set basemap will use the current display language and projection and recreate the basemap
     const language = AppEventProcessor.getDisplayLanguage(mapId);
     const projection = this.getMapState(mapId).currentProjection as TypeValidMapProjectionCodes;
+
+    // Create the core basemap
     const basemap = await this.getMapViewer(mapId).basemap.createCoreBasemap(basemapOptions, projection, language);
 
-    if (basemap) {
-      this.getMapViewer(mapId).basemap.setBasemap(basemap);
-      this.setCurrentBasemapOptions(mapId, basemapOptions);
-    }
+    // Set the basemap and basemap options
+    this.getMapViewer(mapId).basemap.setBasemap(basemap);
+    this.setCurrentBasemapOptions(mapId, basemapOptions);
   }
 
   static setMapKeyboardPanInteractions(mapId: string, panDelta: number): void {
@@ -916,7 +989,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
     }
 
     // Invalid extent
-    throw new GeoViewError(mapId, `Couldn't zoom to extent, invalid extent: ${extent}`);
+    throw new InvalidExtentError(extent);
   }
 
   static async zoomToGeoLocatorLocation(mapId: string, coords: Coordinate, bbox?: Extent): Promise<void> {
@@ -930,7 +1003,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
       // GV There were issues with fromLonLat in rare cases in LCC projections, transformExtentFromProj seems to solve them.
       // GV fromLonLat and transformExtentFromProj give differing results in many cases, fromLonLat had issues with the first
       // GV three results from a geolocator search for "vancouver river"
-      const convertedExtent = Projection.transformExtentFromProj(bbox, Projection.PROJECTION_NAMES.LNGLAT, projectionConfig);
+      const convertedExtent = Projection.transformExtentFromProj(bbox, Projection.getProjectionLngLat(), projectionConfig);
 
       // Highlight
       this.getMapViewerLayerAPI(mapId).featureHighlight.highlightGeolocatorBBox(convertedExtent);
@@ -993,7 +1066,15 @@ export class MapEventProcessor extends AbstractEventProcessor {
     // If extent is in config, use it
     if (homeView!.extent) {
       const lnglatExtent = homeView!.extent as Extent;
-      extent = Projection.transformExtentFromProj(lnglatExtent, Projection.PROJECTION_NAMES.LNGLAT, `EPSG:${currProjection}`);
+      // If extent is not lon/lat, we assume it is in the map projection and use it as is.
+      extent = isExtentLngLat(lnglatExtent)
+        ? Projection.transformExtentFromProj(
+            lnglatExtent,
+            Projection.getProjectionLngLat(),
+            Projection.getProjectionFromString(`EPSG:${currProjection}`)
+          )
+        : lnglatExtent;
+
       options.padding = [0, 0, 0, 0];
     }
 
@@ -1002,7 +1083,12 @@ export class MapEventProcessor extends AbstractEventProcessor {
 
     // If extent is not valid, take the default one for the current projection
     if (extent.length !== 4 || extent.includes(Infinity))
-      extent = Projection.transformExtentFromProj(CV_MAP_EXTENTS[currProjection], `EPSG:4326`, `EPSG:${currProjection}`);
+      extent = Projection.transformExtentFromProj(
+        CV_MAP_EXTENTS[currProjection],
+        Projection.getProjectionLngLat(),
+        Projection.getProjectionFromString(`EPSG:${currProjection}`)
+      );
+
     return this.zoomToExtent(mapId, extent, options);
   }
 
@@ -1048,7 +1134,7 @@ export class MapEventProcessor extends AbstractEventProcessor {
     // Change view to go to proper zoom centered in the middle of layer extent
     // If there is no layerExtent or if the zoom needs to zoom out, the center will be undefined and not use
     // Check if the map center is already in the layer extent and if so, do not center
-    const layerExtent = (geoviewLayer! as AbstractGVLayer).getBounds();
+    const layerExtent = (geoviewLayer! as AbstractGVLayer).getBounds(this.getMapViewer(mapId).getProjection(), MapViewer.DEFAULT_STOPS);
     const centerExtent =
       layerExtent && layerMinZoom > mapZoom! && !isPointInExtent(view.getCenter()!, layerExtent)
         ? [(layerExtent[2] + layerExtent[0]) / 2, (layerExtent[1] + layerExtent[3]) / 2]
@@ -1129,8 +1215,17 @@ export class MapEventProcessor extends AbstractEventProcessor {
         const filters = this.getActiveVectorFilters(mapId, layerPath) || [''];
         const filter = filters.join(' and ');
 
-        // Force the layer to applyfilter so it refresh for layer class selection (esri layerDef) even if no other filter are applied.
-        geoviewLayer.applyViewFilter(filter);
+        // If EsriDynamic
+        if (geoviewLayer instanceof GVEsriDynamic) {
+          // Force the layer to applyfilter so it refreshes its layerDefs
+          geoviewLayer.applyViewFilter(filter);
+        } else if (geoviewLayer instanceof AbstractGVVector) {
+          // Force the layer to applyfilter so it refreshes its layer config filter
+          geoviewLayer.applyViewFilter(filter);
+        } else {
+          // Not supported
+          throw new NotSupportedError('Layer type not supported when trying to perform an applyLayerFilters.');
+        }
       }
     }
   }
@@ -1261,11 +1356,22 @@ export class MapEventProcessor extends AbstractEventProcessor {
    * @param {string} mapId - Id of map.
    * @param {string} layerPath - Path of the layer to create config for.
    * @param {boolean | "hybrid"} overrideGeocoreServiceNames - Indicates if geocore layer names should be kept as is or returned to defaults.
-   * @returns {MapConfigLayerEntry} Geoview layer config object.
+   * @returns {MapConfigLayerEntry | undefined} Geoview layer config object.
    */
-  static #createGeoviewLayerConfig(mapId: string, layerPath: string, overrideGeocoreServiceNames: boolean | 'hybrid'): MapConfigLayerEntry {
+  static #createGeoviewLayerConfig(
+    mapId: string,
+    layerPath: string,
+    overrideGeocoreServiceNames: boolean | 'hybrid'
+  ): MapConfigLayerEntry | undefined {
     // Get needed info
-    const layerEntryConfig = MapEventProcessor.getMapViewerLayerAPI(mapId).getLayerEntryConfig(layerPath)!;
+    const layerEntryConfig = MapEventProcessor.getMapViewerLayerAPI(mapId).getLayerEntryConfig(layerPath);
+
+    // If not found, log warning and skip
+    if (!layerEntryConfig) {
+      // Log
+      logger.logWarning(`Couldn't find the layer entry config for layer path '${layerPath}'`);
+      return undefined;
+    }
 
     const { geoviewLayerConfig } = layerEntryConfig;
     const orderedLayerInfo = MapEventProcessor.findMapLayerFromOrderedInfo(mapId, layerPath);
@@ -1337,9 +1443,9 @@ export class MapEventProcessor extends AbstractEventProcessor {
       );
 
       // Build list of geoview layer configs
-      const listOfGeoviewLayerConfig = layerOrder.map((layerPath) =>
-        this.#createGeoviewLayerConfig(mapId, layerPath, overrideGeocoreServiceNames)
-      );
+      const listOfGeoviewLayerConfig = layerOrder
+        .map((layerPath) => this.#createGeoviewLayerConfig(mapId, layerPath, overrideGeocoreServiceNames))
+        .filter((mapLayerEntry) => !!mapLayerEntry);
 
       // Get info for view
       const projection = this.getMapStateProtected(mapId).currentProjection as TypeValidMapProjectionCodes;

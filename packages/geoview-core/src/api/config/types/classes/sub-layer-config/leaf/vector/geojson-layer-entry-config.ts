@@ -4,7 +4,7 @@ import { Cast } from '@/api/config/types/config-types';
 import {
   TypeLayerStyleConfig,
   TypeLayerEntryType,
-  TypeSourceGeoJsonInitialConfig,
+  TypeBaseVectorSourceInitialConfig,
   TypeFeatureInfoLayerConfig,
   TypeStyleGeometry,
   TypeLayerInitialSettings,
@@ -29,7 +29,7 @@ export class GeoJsonLayerEntryConfig extends AbstractBaseLayerEntryConfig {
   // ==================
   // #region PROPERTIES
   /** Source settings to apply to the GeoView image layer source at creation time. */
-  declare source: TypeSourceGeoJsonInitialConfig;
+  declare source: TypeBaseVectorSourceInitialConfig;
 
   /** Style to apply to the raster layer. */
   layerStyle?: TypeLayerStyleConfig;
@@ -123,9 +123,8 @@ export class GeoJsonLayerEntryConfig extends AbstractBaseLayerEntryConfig {
       strategy: 'all',
       maxRecordCount: 0,
       crossOrigin: 'Anonymous',
-      projection: 3978,
       featureInfo: {
-        queryable: false,
+        queryable: true,
         nameField: '',
         outfields: [],
       },

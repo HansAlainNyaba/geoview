@@ -8,10 +8,12 @@ import { WMS } from '@/geo/layer/geoview-layers/raster/wms';
 import { TypeFeatureInfoLayerConfig, TypeLayerEntryConfig, layerEntryIsGroupLayer } from '@/api/config/types/map-schema-types';
 import { MapEventProcessor } from '@/api/event-processors/event-processor-children/map-event-processor';
 import { UIEventProcessor } from '@/api/event-processors/event-processor-children/ui-event-processor';
+import { AppEventProcessor } from '@/api/event-processors/event-processor-children/app-event-processor';
 import { GVWMS } from '@/geo/layer/gv-layers/raster/gv-wms';
 import { GVEsriImage } from '@/geo/layer/gv-layers/raster/gv-esri-image';
 import { AbstractGVLayer } from '@/geo/layer/gv-layers/abstract-gv-layer';
 import { DateMgt } from '@/core/utils/date-mgt';
+import { logger } from '@/core/utils/logger';
 
 // GV Important: See notes in header of MapEventProcessor file for information on the paradigm to apply when working with UIEventProcessor vs UIState
 
@@ -69,9 +71,15 @@ export class TimeSliderEventProcessor extends AbstractEventProcessor {
    * @param {string} mapId - The map id of the state to act on
    * @param {TypeLayerEntryConfig} layerConfig - The layer path of the layer to add to the state
    */
-  static checkInitTimeSliderLayerAndApplyFilters(mapId: string, layerConfig: TypeLayerEntryConfig): void {
+  static checkInitTimeSliderLayerAndApplyFilters(mapId: string, layer: AbstractGVLayer, layerConfig: TypeLayerEntryConfig): void {
     // If there is no TimeSlider
     if (!this.getTimesliderState(mapId)) return;
+
+    // Get the temporal dimension, if any
+    const tempDimension = layer.getTemporalDimension();
+
+    // If no temporal dimension or invalid
+    if (!tempDimension || !tempDimension.isValid) return; // Skip
 
     // Get the time slider values
     const timeSliderValues = this.getInitialTimeSliderValues(mapId, layerConfig);
@@ -299,6 +307,14 @@ export class TimeSliderEventProcessor extends AbstractEventProcessor {
     this.getTimesliderState(mapId)?.setterActions.setValues(layerPath, values);
     this.addOrUpdateSliderFilter(mapId, layerPath, filter);
     MapEventProcessor.applyLayerFilters(mapId, layerPath);
+
+    // If we aren't showing unsymbolized features, then we need to update the feature info layer set
+    // so the data table matches the features from the time slider filter
+    if (!AppEventProcessor.getShowUnsymbolizedFeatures(mapId)) {
+      MapEventProcessor.getMapViewerLayerAPI(mapId)
+        .allFeatureInfoLayerSet.queryLayer(layerPath, 'all')
+        .catch((error) => logger.logError(error));
+    }
   }
   // #endregion
 }

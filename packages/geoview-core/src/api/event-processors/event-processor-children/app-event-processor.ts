@@ -8,7 +8,7 @@ import { MapEventProcessor } from './map-event-processor';
 import { SnackbarType } from '@/core/utils/notifications';
 import { logger } from '@/core/utils/logger';
 import { api } from '@/app';
-import i18n from '@/core/translation/i18n';
+import { formatError } from '@/core/exceptions/core-exceptions';
 
 // GV Important: See notes in header of MapEventProcessor file for information on the paradigm to apply when working with UIEventProcessor vs UIState
 
@@ -59,25 +59,34 @@ export class AppEventProcessor extends AbstractEventProcessor {
   }
 
   /**
+   * Shortcut to get the display theme for a given map id
+   * @param {string} mapId - The mapId
+   * @returns {TypeDisplayTheme} The display theme.
+   */
+  static getShowUnsymbolizedFeatures(mapId: string): boolean {
+    return this.getAppState(mapId).showUnsymbolizedFeatures;
+  }
+
+  /**
    * Adds a snackbar message (optional add to notification).
    * @param {SnackbarType} type - The type of message.
-   * @param {string} message - The message.
+   * @param {string} messageKey - The message key.
    * @param {string} param - Optional param to replace in the string if it is a key
    * @param {boolean} notification - True if we add the message to notification panel (default false)
    */
-  static addMessage(mapId: string, type: SnackbarType, message: string, param?: string[], notification: boolean = false): void {
+  static addMessage(mapId: string, type: SnackbarType, messageKey: string, param?: string[], notification: boolean = false): void {
     switch (type) {
       case 'info':
-        api.getMapViewer(mapId).notifications.showMessage(message, param, notification);
+        api.getMapViewer(mapId).notifications.showMessage(messageKey, param, notification);
         break;
       case 'success':
-        api.getMapViewer(mapId).notifications.showSuccess(message, param, notification);
+        api.getMapViewer(mapId).notifications.showSuccess(messageKey, param, notification);
         break;
       case 'warning':
-        api.getMapViewer(mapId).notifications.showWarning(message, param, notification);
+        api.getMapViewer(mapId).notifications.showWarning(messageKey, param, notification);
         break;
       case 'error':
-        api.getMapViewer(mapId).notifications.showError(message, param, notification);
+        api.getMapViewer(mapId).notifications.showError(messageKey, param, notification);
         break;
       default:
         break;
@@ -121,7 +130,7 @@ export class AppEventProcessor extends AbstractEventProcessor {
     // Return a new promise of void when all will be done instead of promise of array of voids
     return new Promise((resolve, reject) => {
       // Change language in i18n for the useTranslation used by the ui components
-      const promiseChangeLanguage = i18n.changeLanguage(lang);
+      const promiseChangeLanguage = MapEventProcessor.getMapViewer(mapId).getI18nInstance().changeLanguage(lang);
 
       this.getAppState(mapId).setterActions.setDisplayLanguage(lang);
 
@@ -140,10 +149,9 @@ export class AppEventProcessor extends AbstractEventProcessor {
           // Now resolve
           resolve();
         })
-        .catch((error) => {
-          // Log and reject
-          logger.logPromiseFailed('inner promise in app-event-processor.setDisplayLanguage', error);
-          reject();
+        .catch((error: unknown) => {
+          // Reject
+          reject(formatError(error));
         });
     });
   }
